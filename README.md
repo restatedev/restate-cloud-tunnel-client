@@ -12,3 +12,8 @@ The tunnel client must be configured with the following values:
 - `RESTATE_SIGNING_PUBLIC_KEY`: the signing public key of your Restate Cloud environment. This allows the client to validate that incoming requests come from your environment.
 - `RESTATE_BEARER_TOKEN`: a Restate Cloud API key with the `Admin` or `Full` role
 - `RESTATE_TUNNEL_SERVERS_SRV`: The SRV record for the client to find tunnel servers. This is specific to the region in which your environment runs eg `tunnel.us.restate.cloud`, `tunnel.eu.restate.cloud`.
+
+## Releasing
+1. Update the version in Cargo.{toml,lock} eg to 0.0.2
+2. Push a new tag v0.0.2
+3. Accept the draft release once the workflow finishes

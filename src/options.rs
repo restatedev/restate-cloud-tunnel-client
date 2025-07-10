@@ -1,6 +1,12 @@
-use std::{collections::HashSet, num::NonZeroUsize, path::Path, time::Duration};
+use std::{
+    collections::HashSet,
+    net::{SocketAddr, SocketAddrV4},
+    num::NonZeroUsize,
+    path::{Path, PathBuf},
+    time::Duration,
+};
 
-use anyhow::bail;
+use anyhow::{Context, bail};
 use figment::{
     Figment,
     providers::{Env, Format, Serialized, Toml},
@@ -10,6 +16,7 @@ use http::Uri;
 use restate_types::config::Http2KeepAliveOptions;
 use serde::{Deserialize, Serialize};
 use serde_with::serde_as;
+use tracing::info;
 
 use crate::srv::{HickoryResolver, Resolver, fixed_uri_stream};
 
@@ -26,12 +33,13 @@ struct OptionsShadow {
     #[serde_as(as = "Option<serde_with::DisplayFromStr>")]
     tunnel_servers_srv: Option<hickory_resolver::Name>,
     bearer_token: Option<String>,
-    bearer_token_file: Option<String>,
+    bearer_token_file: Option<PathBuf>,
     connect_timeout: Duration,
     pools_per_tunnel: NonZeroUsize,
     initial_max_send_streams: Option<usize>,
     http_keep_alive_options: Http2KeepAliveOptions,
     shutdown_timeout: Duration,
+    serve_address: SocketAddr,
 }
 
 impl Default for OptionsShadow {
@@ -49,6 +57,7 @@ impl Default for OptionsShadow {
             initial_max_send_streams: None,
             http_keep_alive_options: Http2KeepAliveOptions::default(),
             shutdown_timeout: Duration::from_secs(300),
+            serve_address: SocketAddr::V4(SocketAddrV4::new([0, 0, 0, 0].into(), 9090)),
         }
     }
 }
@@ -64,6 +73,7 @@ pub struct Options {
     pub initial_max_send_streams: Option<usize>,
     pub http_keep_alive_options: Http2KeepAliveOptions,
     pub shutdown_timeout: Duration,
+    pub serve_address: SocketAddr,
 }
 
 impl Options {
@@ -88,7 +98,17 @@ impl Options {
                 );
             }
             (Some(bearer_token), _) => bearer_token,
-            (None, Some(_)) => todo!(),
+            (None, Some(bearer_token_file)) => {
+                let mut bearer_token = tokio::fs::read_to_string(&bearer_token_file)
+                    .await
+                    .context("failed to read bearer token file")?;
+                bearer_token.truncate(bearer_token.trim_end().len());
+                info!(
+                    "Loaded initial bearer token from {}",
+                    bearer_token_file.display()
+                );
+                bearer_token
+            }
         };
 
         let Some(environment_id) = shadow.environment_id else {
@@ -131,6 +151,7 @@ impl Options {
             initial_max_send_streams: shadow.initial_max_send_streams,
             http_keep_alive_options: shadow.http_keep_alive_options,
             shutdown_timeout: shadow.shutdown_timeout,
+            serve_address: shadow.serve_address,
         })
     }
 }

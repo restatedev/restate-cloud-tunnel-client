@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+actix-web = "4.11.0"
 anyhow = "1.0.98"
 bytes = "1.10.1"
 clap = {version = "4.5.40", features = ["derive", "env"] }
@@ -19,7 +20,7 @@ restate-cloud-tunnel-client = { git = "https://github.com/restatedev/restate.git
 restate-types = { git = "https://github.com/restatedev/restate.git", rev = "4f7ffddc4fdebe4dd05e616fae48998c69a4bd36", default-features = false }
 serde = "1.0.219"
 serde_with = "3.13.0"
-tokio = { version = "1.45.1", features = ["rt"] }
+tokio = { version = "1.45.1", features = ["rt", "fs", "sync"] }
 tokio-util = { version = "0.7.15", features = ["rt"] }
 tracing = "0.1.41"
 tracing-subscriber = { version = "0.3.19", features = ["json", "env-filter"]}

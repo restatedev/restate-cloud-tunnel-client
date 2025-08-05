@@ -3,6 +3,7 @@ use std::{
     net::{SocketAddr, SocketAddrV4},
     num::NonZeroUsize,
     path::{Path, PathBuf},
+    str::FromStr,
     time::Duration,
 };
 
@@ -17,6 +18,7 @@ use restate_types::config::Http2KeepAliveOptions;
 use serde::{Deserialize, Serialize};
 use serde_with::serde_as;
 use tracing::info;
+use url::Url;
 
 use crate::srv::{HickoryResolver, Resolver, fixed_uri_stream};
 
@@ -24,7 +26,6 @@ use crate::srv::{HickoryResolver, Resolver, fixed_uri_stream};
 #[derive(Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 struct OptionsShadow {
-    // todo; is it really necessary if we provide a token
     environment_id: Option<String>,
     signing_public_key: Option<String>,
     tunnel_name: Option<String>,
@@ -39,7 +40,16 @@ struct OptionsShadow {
     initial_max_send_streams: Option<usize>,
     http_keep_alive_options: Http2KeepAliveOptions,
     shutdown_timeout: Duration,
-    serve_address: SocketAddr,
+    health_serve_address: SocketAddr,
+    ingress_serve_address: SocketAddr,
+    admin_serve_address: SocketAddr,
+    #[serde_as(as = "serde_with::DisplayFromStr")]
+    cloud_suffix: hickory_resolver::Name,
+    cloud_region: Option<String>,
+    #[serde_as(as = "Option<serde_with::DisplayFromStr>")]
+    ingress_url: Option<Url>,
+    #[serde_as(as = "Option<serde_with::DisplayFromStr>")]
+    admin_url: Option<Url>,
 }
 
 impl Default for OptionsShadow {
@@ -57,7 +67,14 @@ impl Default for OptionsShadow {
             initial_max_send_streams: None,
             http_keep_alive_options: Http2KeepAliveOptions::default(),
             shutdown_timeout: Duration::from_secs(300),
-            serve_address: SocketAddr::V4(SocketAddrV4::new([0, 0, 0, 0].into(), 9090)),
+            health_serve_address: SocketAddr::V4(SocketAddrV4::new([0, 0, 0, 0].into(), 9090)),
+            ingress_serve_address: SocketAddr::V4(SocketAddrV4::new([0, 0, 0, 0].into(), 8080)),
+            admin_serve_address: SocketAddr::V4(SocketAddrV4::new([0, 0, 0, 0].into(), 9070)),
+            cloud_suffix: hickory_resolver::Name::from_str("restate.cloud")
+                .expect("restate.cloud is a valid domain"),
+            cloud_region: None,
+            ingress_url: None,
+            admin_url: None,
         }
     }
 }
@@ -65,15 +82,23 @@ impl Default for OptionsShadow {
 pub struct Options {
     pub environment_id: String,
     pub signing_public_key: String,
+    pub bearer_token: String,
+
     pub tunnel_name: String,
     pub tunnel_servers: BoxStream<'static, HashSet<Uri>>,
-    pub bearer_token: String,
+
     pub connect_timeout: Duration,
     pub pools_per_tunnel: NonZeroUsize,
     pub initial_max_send_streams: Option<usize>,
     pub http_keep_alive_options: Http2KeepAliveOptions,
     pub shutdown_timeout: Duration,
-    pub serve_address: SocketAddr,
+    pub health_serve_address: SocketAddr,
+
+    pub ingress_serve_address: SocketAddr,
+    pub ingress_url: Url,
+
+    pub admin_serve_address: SocketAddr,
+    pub admin_url: Url,
 }
 
 impl Options {
@@ -123,20 +148,81 @@ impl Options {
             bail!("The option 'tunnel_name' (RESTATE_TUNNEL_NAME) must be provided");
         };
 
-        let tunnel_servers = match (shadow.tunnel_servers, shadow.tunnel_servers_srv) {
-            (None, None) => {
+        let tunnel_servers = match (
+            shadow.tunnel_servers,
+            shadow.tunnel_servers_srv,
+            &shadow.cloud_region,
+        ) {
+            (None, None, None) => {
                 bail!(
-                    "Either 'tunnel_servers' (RESTATE_TUNNEL_SERVERS) or 'tunnel_servers_srv' (RESTATE_TUNNEL_SERVERS_SRV) options must be provided"
+                    "Either 'tunnel_servers' (RESTATE_TUNNEL_SERVERS), 'tunnel_servers_srv' (RESTATE_TUNNEL_SERVERS_SRV) or 'cloud_region' (RESTATE_CLOUD_REGION) options must be provided"
                 );
             }
-            (Some(tunnel_servers), _) => fixed_uri_stream(tunnel_servers).boxed(),
-            (None, Some(tunnel_servers_srv)) => {
+            (Some(tunnel_servers), _, _) => fixed_uri_stream(tunnel_servers).boxed(),
+            (None, Some(tunnel_servers_srv), _) => {
                 let resolver = HickoryResolver::new();
 
                 // check once that it resolves
                 resolver.resolve(tunnel_servers_srv.clone()).await?;
 
                 resolver.into_stream(tunnel_servers_srv).boxed()
+            }
+            (None, None, Some(cloud_region)) => {
+                let resolver = HickoryResolver::new();
+
+                let tunnel_servers_srv = shadow
+                    .cloud_suffix
+                    .prepend_label(cloud_region.clone())?
+                    .prepend_label("tunnel")?;
+
+                // check once that it resolves
+                resolver.resolve(tunnel_servers_srv.clone()).await?;
+
+                resolver.into_stream(tunnel_servers_srv).boxed()
+            }
+        };
+
+        let ingress_url = match (shadow.ingress_url, &shadow.cloud_region) {
+            (None, None) => {
+                bail!(
+                    "Either 'ingress_url' (RESTATE_INGRESS_URL), or 'cloud_suffix' (RESTATE_CLOUD_SUFFIX) options must be provided"
+                );
+            }
+            (Some(ingress_url), _) => ingress_url,
+            (None, Some(cloud_region)) => {
+                let unprefixed_environment_id = environment_id
+                    .strip_prefix("env_")
+                    .unwrap_or(&environment_id);
+                let ingress_name = shadow
+                    .cloud_suffix
+                    .prepend_label(cloud_region.clone())?
+                    .prepend_label("env")?
+                    .prepend_label(unprefixed_environment_id)?;
+
+                Url::from_str(&format!("https://{ingress_name}:8080"))
+                    .context("Invalid cloud_suffix")?
+            }
+        };
+
+        let admin_url = match (shadow.admin_url, &shadow.cloud_region) {
+            (None, None) => {
+                bail!(
+                    "Either 'admin_url' (RESTATE_ADMIN_URL), or 'cloud_suffix' (RESTATE_CLOUD_SUFFIX) options must be provided"
+                );
+            }
+            (Some(admin_url), _) => admin_url,
+            (None, Some(cloud_region)) => {
+                let unprefixed_environment_id = environment_id
+                    .strip_prefix("env_")
+                    .unwrap_or(&environment_id);
+                let admin_name = shadow
+                    .cloud_suffix
+                    .prepend_label(cloud_region.clone())?
+                    .prepend_label("env")?
+                    .prepend_label(unprefixed_environment_id)?;
+
+                Url::from_str(&format!("https://{admin_name}:9070"))
+                    .context("Invalid cloud_suffix")?
             }
         };
 
@@ -151,7 +237,11 @@ impl Options {
             initial_max_send_streams: shadow.initial_max_send_streams,
             http_keep_alive_options: shadow.http_keep_alive_options,
             shutdown_timeout: shadow.shutdown_timeout,
-            serve_address: shadow.serve_address,
+            health_serve_address: shadow.health_serve_address,
+            ingress_serve_address: shadow.ingress_serve_address,
+            ingress_url,
+            admin_serve_address: shadow.admin_serve_address,
+            admin_url,
         })
     }
 }

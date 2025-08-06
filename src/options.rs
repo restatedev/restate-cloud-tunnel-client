@@ -18,7 +18,6 @@ use restate_types::config::Http2KeepAliveOptions;
 use serde::{Deserialize, Serialize};
 use serde_with::serde_as;
 use tracing::info;
-use url::Url;
 
 use crate::srv::{HickoryResolver, Resolver, fixed_uri_stream};
 
@@ -47,9 +46,9 @@ struct OptionsShadow {
     cloud_suffix: hickory_resolver::Name,
     cloud_region: Option<String>,
     #[serde_as(as = "Option<serde_with::DisplayFromStr>")]
-    ingress_url: Option<Url>,
+    ingress_uri: Option<Uri>,
     #[serde_as(as = "Option<serde_with::DisplayFromStr>")]
-    admin_url: Option<Url>,
+    admin_uri: Option<Uri>,
 }
 
 impl Default for OptionsShadow {
@@ -73,8 +72,8 @@ impl Default for OptionsShadow {
             cloud_suffix: hickory_resolver::Name::from_str("restate.cloud")
                 .expect("restate.cloud is a valid domain"),
             cloud_region: None,
-            ingress_url: None,
-            admin_url: None,
+            ingress_uri: None,
+            admin_uri: None,
         }
     }
 }
@@ -95,10 +94,10 @@ pub struct Options {
     pub health_serve_address: SocketAddr,
 
     pub ingress_serve_address: SocketAddr,
-    pub ingress_url: Url,
+    pub ingress_uri: Uri,
 
     pub admin_serve_address: SocketAddr,
-    pub admin_url: Url,
+    pub admin_uri: Uri,
 }
 
 impl Options {
@@ -182,13 +181,13 @@ impl Options {
             }
         };
 
-        let ingress_url = match (shadow.ingress_url, &shadow.cloud_region) {
+        let ingress_uri = match (shadow.ingress_uri, &shadow.cloud_region) {
             (None, None) => {
                 bail!(
-                    "Either 'ingress_url' (RESTATE_INGRESS_URL), or 'cloud_suffix' (RESTATE_CLOUD_SUFFIX) options must be provided"
+                    "Either 'ingress_uri' (RESTATE_INGRESS_URI), or 'cloud_region' (RESTATE_CLOUD_REGION) options must be provided"
                 );
             }
-            (Some(ingress_url), _) => ingress_url,
+            (Some(ingress_uri), _) => ingress_uri,
             (None, Some(cloud_region)) => {
                 let unprefixed_environment_id = environment_id
                     .strip_prefix("env_")
@@ -199,18 +198,17 @@ impl Options {
                     .prepend_label("env")?
                     .prepend_label(unprefixed_environment_id)?;
 
-                Url::from_str(&format!("https://{ingress_name}:8080"))
-                    .context("Invalid cloud_suffix")?
+                Uri::from_str(&format!("https://{ingress_name}:8080"))?
             }
         };
 
-        let admin_url = match (shadow.admin_url, &shadow.cloud_region) {
+        let admin_uri = match (shadow.admin_uri, &shadow.cloud_region) {
             (None, None) => {
                 bail!(
-                    "Either 'admin_url' (RESTATE_ADMIN_URL), or 'cloud_suffix' (RESTATE_CLOUD_SUFFIX) options must be provided"
+                    "Either 'admin_uri' (RESTATE_ADMIN_URI), or 'cloud_region' (RESTATE_CLOUD_REGION) options must be provided"
                 );
             }
-            (Some(admin_url), _) => admin_url,
+            (Some(admin_uri), _) => admin_uri,
             (None, Some(cloud_region)) => {
                 let unprefixed_environment_id = environment_id
                     .strip_prefix("env_")
@@ -221,8 +219,7 @@ impl Options {
                     .prepend_label("env")?
                     .prepend_label(unprefixed_environment_id)?;
 
-                Url::from_str(&format!("https://{admin_name}:9070"))
-                    .context("Invalid cloud_suffix")?
+                Uri::from_str(&format!("https://{admin_name}:9070"))?
             }
         };
 
@@ -239,9 +236,9 @@ impl Options {
             shutdown_timeout: shadow.shutdown_timeout,
             health_serve_address: shadow.health_serve_address,
             ingress_serve_address: shadow.ingress_serve_address,
-            ingress_url,
+            ingress_uri,
             admin_serve_address: shadow.admin_serve_address,
-            admin_url,
+            admin_uri,
         })
     }
 }

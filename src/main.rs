@@ -10,7 +10,7 @@ use std::{
     time::Duration,
 };
 
-use actix_web::{App, HttpRequest, HttpResponse, HttpServer, Responder, web::Data};
+use axum::response::IntoResponse;
 use bytes::{BufMut, Bytes, BytesMut};
 use clap::Parser;
 use futures::StreamExt;
@@ -25,8 +25,9 @@ use restate_types::retries::RetryPolicy;
 use serde::Serialize;
 use tokio::sync::watch;
 use tokio_util::{sync::CancellationToken, task::TaskTracker};
-use tracing::{Instrument, debug, error, info, info_span, warn};
+use tracing::{Instrument, debug, debug_span, error, info, info_span, warn};
 use tracing_subscriber::filter::LevelFilter;
+use url::Url;
 
 use crate::{options::Options, signal::shutdown};
 
@@ -93,27 +94,82 @@ pub async fn main() -> anyhow::Result<()> {
     let token = CancellationToken::new();
     let mut shutdown_fut = std::pin::pin!(shutdown());
 
-    let mut health_server = std::pin::pin!(
-        HttpServer::new({
-            let uris = uris.clone();
-            move || {
-                App::new()
-                    .app_data(Data::new(HealthState { uris: uris.clone() }))
-                    .service(health)
-            }
-        })
-        .bind(options.serve_address)?
-        .shutdown_timeout(5)
-        .run()
-    );
+    let client = reqwest::Client::new();
+
+    {
+        let router = axum::Router::new()
+            .route("/health", axum::routing::get(health))
+            .with_state(HealthState { uris: uris.clone() });
+
+        let server = axum::serve(
+            tokio::net::TcpListener::bind(options.health_serve_address).await?,
+            router.into_make_service(),
+        )
+        .with_graceful_shutdown(token.clone().cancelled_owned());
+
+        info!(
+            address = %options.health_serve_address,
+            "Serving health endpoint"
+        );
+
+        tokio::spawn(connections.track_future(server.into_future()));
+    };
+
+    let authorization = {
+        let authorization: &'static str =
+            Box::leak(Box::<str>::from(format!("Bearer {}", options.bearer_token)));
+        let mut authorization = http::HeaderValue::from_static(authorization);
+        authorization.set_sensitive(true);
+        authorization
+    };
+
+    {
+        let router = axum::Router::new().fallback(proxy).with_state(ProxyState {
+            base_url: Box::leak(Box::new(options.ingress_url.clone().into())),
+            client: client.clone(),
+            authorization: authorization.clone(),
+        });
+
+        let server = axum::serve(
+            tokio::net::TcpListener::bind(options.ingress_serve_address).await?,
+            router.into_make_service(),
+        )
+        .with_graceful_shutdown(token.clone().cancelled_owned());
+
+        info!(
+            address = %options.ingress_serve_address,
+            destination = %options.ingress_url,
+            "Serving ingress proxy endpoint"
+        );
+
+        tokio::spawn(connections.track_future(server.into_future()));
+    };
+
+    {
+        let router = axum::Router::new().fallback(proxy).with_state(ProxyState {
+            base_url: Box::leak(Box::new(options.admin_url.clone())),
+            client,
+            authorization,
+        });
+
+        let server = axum::serve(
+            tokio::net::TcpListener::bind(options.admin_serve_address).await?,
+            router.into_make_service(),
+        )
+        .with_graceful_shutdown(token.clone().cancelled_owned());
+
+        info!(
+            address = %options.admin_serve_address,
+            destination = %options.admin_url,
+            "Serving admin proxy endpoint"
+        );
+
+        tokio::spawn(connections.track_future(server.into_future()));
+    };
 
     loop {
         let tunnel_servers = tokio::select! {
             _ = &mut shutdown_fut => {
-                break
-            }
-            Err(err) = &mut health_server => {
-                error!("Health server exited unexpectedly: {err}");
                 break
             }
             tunnel_servers = options.tunnel_servers.next() => {
@@ -194,6 +250,7 @@ pub async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
+#[derive(Clone)]
 struct HealthState {
     #[allow(clippy::type_complexity)]
     uris: Arc<RwLock<HashMap<Uri, (CancellationToken, watch::Receiver<TunnelStatus>)>>>,
@@ -205,8 +262,9 @@ struct HealthOutput(
     #[serde_as(as = "HashMap<serde_with::DisplayFromStr, _>")] HashMap<Uri, TunnelStatus>,
 );
 
-#[actix_web::get("/health")]
-async fn health(state: Data<HealthState>, _: HttpRequest) -> impl Responder {
+async fn health(
+    axum::extract::State(state): axum::extract::State<HealthState>,
+) -> axum::response::Response {
     match state.uris.read() {
         Ok(uris) => {
             let mut statuses = HashMap::new();
@@ -219,13 +277,90 @@ async fn health(state: Data<HealthState>, _: HttpRequest) -> impl Responder {
                 }
             }
             if all_open && !statuses.is_empty() {
-                HttpResponse::Ok().json(HealthOutput(statuses))
+                axum::Json(HealthOutput(statuses)).into_response()
             } else {
-                HttpResponse::InternalServerError().json(HealthOutput(statuses))
+                let mut resp = axum::Json(HealthOutput(statuses)).into_response();
+                *resp.status_mut() = http::StatusCode::INTERNAL_SERVER_ERROR;
+                resp
             }
         }
-        Err(_) => HttpResponse::InternalServerError().body("poisoned"),
+        Err(_) => {
+            let mut resp = "poisoned".into_response();
+            *resp.status_mut() = http::StatusCode::INTERNAL_SERVER_ERROR;
+            resp
+        }
     }
+}
+
+#[derive(Clone)]
+struct ProxyState {
+    base_url: &'static Url,
+    client: reqwest::Client,
+    authorization: http::HeaderValue,
+}
+
+async fn proxy(
+    axum::extract::State(state): axum::extract::State<ProxyState>,
+    req: axum::http::Request<axum::body::Body>,
+) -> axum::response::Response {
+    let (mut head, body) = req.into_parts();
+    head.headers.remove(http::header::HOST);
+    head.headers
+        .append(http::header::AUTHORIZATION, state.authorization.clone());
+
+    let url = if let Some(path) = head.uri.path_and_query() {
+        match state.base_url.join(path.as_str()) {
+            Ok(base_url) => base_url,
+            Err(_) => {
+                return http::Response::builder()
+                    .status(http::StatusCode::BAD_GATEWAY)
+                    .body(axum::body::Body::empty())
+                    .expect("http response to build");
+            }
+        }
+    } else {
+        state.base_url.clone()
+    };
+
+    let span = debug_span!("remote_request", destination = %url);
+
+    async {
+        let request = state
+            .client
+            .request(head.method, url)
+            .body(reqwest::Body::wrap_stream(body.into_data_stream()))
+            .headers(head.headers)
+            .build()
+            .expect("http request to build");
+
+        let mut result = match state.client.execute(request).await {
+            Ok(result) => result,
+            Err(err) => {
+                debug!(%err, "Failed to proxy request to Restate Cloud");
+
+                return http::Response::builder()
+                    .status(http::StatusCode::BAD_GATEWAY)
+                    .body(axum::body::Body::empty())
+                    .expect("http response to build");
+            }
+        };
+
+        let mut response = axum::http::Response::builder().status(result.status());
+        if let Some(headers) = response.headers_mut() {
+            std::mem::swap(headers, result.headers_mut())
+        };
+
+        let body = axum::body::Body::from_stream(result.bytes_stream());
+        let response = response.body(body).expect("http response to build");
+
+        debug!(
+            status = response.status().as_u16(),
+            "Proxied request to Restate Cloud",
+        );
+        response
+    }
+    .instrument(span)
+    .await
 }
 
 #[derive(Clone, Copy, Serialize)]
@@ -329,10 +464,8 @@ async fn handle_tunnel_uri<Notify, Client, ClientError, ClientFuture, ResponseBo
         }
 
         if opened {
-            // if the tunnel ran for a reasonable amount of time, don't do any backoff and reset the backoff timer
+            // if the tunnel ran for a reasonable amount of time, reset the backoff timer
             retry_iter = retry_policy.clone().into_iter();
-            let _ = status.send(TunnelStatus::Opening);
-            continue;
         }
 
         let _ = status.send(TunnelStatus::BackingOff);
@@ -424,23 +557,27 @@ async fn do_proxy(
 
     req_parts.uri = destination;
 
-    let span = info_span!("client_request", destination = %req_parts.uri);
+    let span = debug_span!("local_request", destination = %req_parts.uri);
     let req = http::Request::from_parts(req_parts, req_body);
 
     async move {
-        debug!("Proxying request");
-        let response = match client.request(req).await {
+        match client.request(req).await {
             Ok(response) => {
-                debug!("Proxied request with status {}", response.status());
-                response
+                debug!(
+                    status = response.status().as_u16(),
+                    "Proxied request from Restate Cloud"
+                );
+                Ok(response.map(http_body_util::Either::Right))
             }
             Err(err) => {
-                error!("Failed to proxy request: {err}");
-                return Err(err);
-            }
-        };
+                error!(%err, "Failed to proxy request from Restate Cloud");
 
-        Ok(response.map(http_body_util::Either::Right))
+                Ok(http::Response::builder()
+                    .status(StatusCode::BAD_GATEWAY)
+                    .body(http_body_util::Either::Left(http_body_util::Empty::new()))
+                    .unwrap())
+            }
+        }
     }
     .instrument(span)
     .await

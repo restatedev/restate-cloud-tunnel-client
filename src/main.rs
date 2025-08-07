@@ -35,7 +35,8 @@ mod options;
 mod signal;
 mod srv;
 
-const USE_HTTP11: http::HeaderName = http::HeaderName::from_static("x-restate-use-http11");
+const HTTP_VERSION: http::HeaderName =
+    http::HeaderName::from_static("x-restate-tunnel-http-version");
 
 #[derive(Debug, clap::Parser)]
 struct Arguments {
@@ -95,8 +96,8 @@ pub async fn main() -> anyhow::Result<()> {
     let mut shutdown_fut = std::pin::pin!(shutdown());
 
     // we can use a single http1.1 client as the connection reuse behaviour handles multiple ips well
-    let shared_http1_client = builder.build(https_connector.clone());
-    let builder = builder.http2_only(true);
+    let http1_builder = builder.clone();
+    let http2_builder = builder.http2_only(true);
 
     {
         let router = axum::Router::new()
@@ -133,7 +134,7 @@ pub async fn main() -> anyhow::Result<()> {
                 // for calls to restate cloud, we use 6 conns so we have a fair spread over the 3 nlb ips
                 client: round_robin_client(
                     NonZeroUsize::new(6).unwrap(),
-                    builder,
+                    http2_builder,
                     &https_connector,
                 ),
                 authorization: authorization.clone(),
@@ -162,7 +163,7 @@ pub async fn main() -> anyhow::Result<()> {
                 // for calls to restate cloud, we use 6 conns so we have a fair spread over the 3 nlb ips
                 client: round_robin_client(
                     NonZeroUsize::new(6).unwrap(),
-                    builder,
+                    http2_builder,
                     &https_connector,
                 ),
                 authorization,
@@ -220,14 +221,13 @@ pub async fn main() -> anyhow::Result<()> {
             let (status_send, status_recv) = watch::channel(TunnelStatus::Opening);
             let token = token.child_token();
 
-            let http1_client = shared_http1_client.clone();
+            let client =
+                round_robin_client(options.pools_per_tunnel, &http1_builder, &https_connector);
             let http2_client =
-                round_robin_client(options.pools_per_tunnel, &builder, &https_connector);
+                round_robin_client(options.pools_per_tunnel, &http2_builder, &https_connector);
 
             let handler = Handler::<(), ()>::new(
-                hyper::service::service_fn(move |req| {
-                    local_proxy(&http1_client, &http2_client, req)
-                }),
+                hyper::service::service_fn(move |req| local_proxy(&client, &http2_client, req)),
                 options.connect_timeout,
                 &options.environment_id,
                 &options.signing_public_key,
@@ -564,7 +564,7 @@ impl<B> RoundRobinClient<B> {
 }
 
 fn local_proxy(
-    http1_client: &hyper_util::client::legacy::Client<HttpsConnector<HttpConnector>, Incoming>,
+    client: &RoundRobinClient<Incoming>,
     http2_client: &RoundRobinClient<Incoming>,
     req: http::Request<Incoming>,
 ) -> impl Future<
@@ -606,15 +606,37 @@ fn local_proxy(
 
     head.uri = destination;
 
-    // use the http1.1 client for cleartext requests with x-restate-use-http11=true
-    let use_http11 = head.uri.scheme() != Some(&http::uri::Scheme::HTTPS)
-        && head.headers.get(USE_HTTP11) == Some(&http::HeaderValue::from_static("true"));
-
-    let client = if use_http11 {
-        head.version = http::Version::HTTP_11;
-        http1_client
-    } else {
-        http2_client.get()
+    let client = match (
+        head.uri.scheme_str(),
+        head.headers
+            .get(HTTP_VERSION)
+            .map(http::HeaderValue::as_bytes),
+    ) {
+        // https urls will use an alpn client which supports http2 via alpn and http1.1
+        (Some("https"), _) => {
+            // we don't want to force HTTP2 as we don't know if the destination accepts it
+            // a request with HTTP_11 can still end up using h2 if the alpn agrees
+            head.version = http::Version::HTTP_11;
+            client.get()
+        }
+        // cleartext requests, if the user requested http1.1, use it
+        (_, Some(b"HTTP/1.1")) => {
+            head.version = http::Version::HTTP_11;
+            client.get()
+        }
+        // cleartext requests where user requested h2, or didn't request a specific version; use http2 prior-knowledge
+        (_, Some(b"h2") | Some(b"h2c") | None) => {
+            head.version = http::Version::HTTP_2;
+            http2_client.get()
+        }
+        (_, Some(other)) => {
+            warn!(uri = %head.uri, "Tunnel request had an invalid x-restate-tunnel-http-version ({})", String::from_utf8_lossy(other));
+            return std::future::ready(Ok(http::Response::builder()
+                .status(StatusCode::BAD_REQUEST)
+                .body(http_body_util::Either::Left(http_body_util::Empty::new()))
+                .unwrap()))
+            .left_future();
+        }
     };
 
     let req = http::Request::from_parts(head, body);

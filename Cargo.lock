@@ -2525,7 +2525,7 @@ dependencies = [
  "hyper",
  "hyper-rustls",
  "hyper-util",
- "restate-cloud-tunnel-client 1.4.4-dev",
+ "restate-cloud-tunnel-client 1.4.4-rc.2",
  "restate-types",
  "serde",
  "serde_with",
@@ -2537,7 +2537,7 @@ dependencies = [
 
 [[package]]
 name = "restate-cloud-tunnel-client"
-version = "1.4.4-dev"
+version = "1.4.4-rc.2"
 dependencies = [
  "anyhow",
  "bs58",

@@ -34,7 +34,7 @@ pub trait Resolver: Sized {
                     }
                 };
 
-                debug!("Resolved SRV record {srv} into {} urls", uris.len());
+                debug!("Resolved SRV record {srv} into {} uris", uris.len());
 
                 break Some((uris, (resolver, srv, Some(valid_until))));
             }

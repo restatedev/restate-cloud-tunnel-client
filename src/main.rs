@@ -1,6 +1,7 @@
 use std::{
     collections::HashMap,
     fmt::Display,
+    num::NonZeroUsize,
     path::PathBuf,
     str::FromStr,
     sync::{
@@ -13,7 +14,7 @@ use std::{
 use axum::response::IntoResponse;
 use bytes::{BufMut, Bytes, BytesMut};
 use clap::Parser;
-use futures::StreamExt;
+use futures::{FutureExt, StreamExt};
 use http::{Request, Response, StatusCode, Uri};
 use hyper::body::Incoming;
 use hyper_rustls::HttpsConnector;
@@ -27,13 +28,14 @@ use tokio::sync::watch;
 use tokio_util::{sync::CancellationToken, task::TaskTracker};
 use tracing::{Instrument, debug, debug_span, error, info, info_span, warn};
 use tracing_subscriber::filter::LevelFilter;
-use url::Url;
 
 use crate::{options::Options, signal::shutdown};
 
 mod options;
 mod signal;
 mod srv;
+
+const USE_HTTP11: http::HeaderName = http::HeaderName::from_static("x-restate-use-http11");
 
 #[derive(Debug, clap::Parser)]
 struct Arguments {
@@ -70,8 +72,6 @@ pub async fn main() -> anyhow::Result<()> {
     builder.timer(hyper_util::rt::TokioTimer::default());
 
     builder
-        // todo; we can later have separate h2c and http1.1 clients and switch between them based on either a header or some host regex
-        .http2_only(true)
         .http2_initial_max_send_streams(options.initial_max_send_streams)
         .http2_adaptive_window(true)
         .http2_keep_alive_timeout(options.http_keep_alive_options.timeout.into())
@@ -94,7 +94,9 @@ pub async fn main() -> anyhow::Result<()> {
     let token = CancellationToken::new();
     let mut shutdown_fut = std::pin::pin!(shutdown());
 
-    let client = reqwest::Client::new();
+    // we can use a single http1.1 client as the connection reuse behaviour handles multiple ips well
+    let shared_http1_client = builder.build(https_connector.clone());
+    let builder = builder.http2_only(true);
 
     {
         let router = axum::Router::new()
@@ -124,11 +126,18 @@ pub async fn main() -> anyhow::Result<()> {
     };
 
     {
-        let router = axum::Router::new().fallback(proxy).with_state(ProxyState {
-            base_url: Box::leak(Box::new(options.ingress_url.clone().into())),
-            client: client.clone(),
-            authorization: authorization.clone(),
-        });
+        let router = axum::Router::new()
+            .fallback(remote_proxy)
+            .with_state(Arc::new(ProxyState {
+                base_uri: options.ingress_uri.clone(),
+                // for calls to restate cloud, we use 6 conns so we have a fair spread over the 3 nlb ips
+                client: round_robin_client(
+                    NonZeroUsize::new(6).unwrap(),
+                    builder,
+                    &https_connector,
+                ),
+                authorization: authorization.clone(),
+            }));
 
         let server = axum::serve(
             tokio::net::TcpListener::bind(options.ingress_serve_address).await?,
@@ -138,7 +147,7 @@ pub async fn main() -> anyhow::Result<()> {
 
         info!(
             address = %options.ingress_serve_address,
-            destination = %options.ingress_url,
+            destination = %options.ingress_uri,
             "Serving ingress proxy endpoint"
         );
 
@@ -146,11 +155,18 @@ pub async fn main() -> anyhow::Result<()> {
     };
 
     {
-        let router = axum::Router::new().fallback(proxy).with_state(ProxyState {
-            base_url: Box::leak(Box::new(options.admin_url.clone())),
-            client,
-            authorization,
-        });
+        let router = axum::Router::new()
+            .fallback(remote_proxy)
+            .with_state(Arc::new(ProxyState {
+                base_uri: options.admin_uri.clone(),
+                // for calls to restate cloud, we use 6 conns so we have a fair spread over the 3 nlb ips
+                client: round_robin_client(
+                    NonZeroUsize::new(6).unwrap(),
+                    builder,
+                    &https_connector,
+                ),
+                authorization,
+            }));
 
         let server = axum::serve(
             tokio::net::TcpListener::bind(options.admin_serve_address).await?,
@@ -160,7 +176,7 @@ pub async fn main() -> anyhow::Result<()> {
 
         info!(
             address = %options.admin_serve_address,
-            destination = %options.admin_url,
+            destination = %options.admin_uri,
             "Serving admin proxy endpoint"
         );
 
@@ -204,10 +220,14 @@ pub async fn main() -> anyhow::Result<()> {
             let (status_send, status_recv) = watch::channel(TunnelStatus::Opening);
             let token = token.child_token();
 
-            let client = round_robin_client(&options, &builder, &https_connector);
+            let http1_client = shared_http1_client.clone();
+            let http2_client =
+                round_robin_client(options.pools_per_tunnel, &builder, &https_connector);
 
             let handler = Handler::<(), ()>::new(
-                hyper::service::service_fn(move |req| do_proxy(client.get().clone(), req)),
+                hyper::service::service_fn(move |req| {
+                    local_proxy(&http1_client, &http2_client, req)
+                }),
                 options.connect_timeout,
                 &options.environment_id,
                 &options.signing_public_key,
@@ -292,75 +312,94 @@ async fn health(
     }
 }
 
-#[derive(Clone)]
 struct ProxyState {
-    base_url: &'static Url,
-    client: reqwest::Client,
+    base_uri: Uri,
+    client: RoundRobinClient<axum::body::Body>,
     authorization: http::HeaderValue,
 }
 
-async fn proxy(
-    axum::extract::State(state): axum::extract::State<ProxyState>,
-    req: axum::http::Request<axum::body::Body>,
-) -> axum::response::Response {
+async fn remote_proxy(
+    axum::extract::State(state): axum::extract::State<Arc<ProxyState>>,
+    req: http::Request<axum::body::Body>,
+) -> http::Response<
+    impl hyper::body::Body<Data = Bytes, Error = Box<dyn std::error::Error + Send + Sync>>
+    + Send
+    + Sync
+    + 'static,
+> {
     let (mut head, body) = req.into_parts();
-    head.headers.remove(http::header::HOST);
-    head.headers
-        .append(http::header::AUTHORIZATION, state.authorization.clone());
+    remote_proxy_headers(&mut head.headers, state.authorization.clone());
+    head.version = http::Version::HTTP_2;
 
-    let url = if let Some(path) = head.uri.path_and_query() {
-        match state.base_url.join(path.as_str()) {
-            Ok(base_url) => base_url,
-            Err(_) => {
-                return http::Response::builder()
-                    .status(http::StatusCode::BAD_GATEWAY)
-                    .body(axum::body::Body::empty())
-                    .expect("http response to build");
-            }
-        }
-    } else {
-        state.base_url.clone()
+    let mut uri_parts = head.uri.into_parts();
+    uri_parts.scheme = state.base_uri.scheme().cloned();
+    uri_parts.authority = state.base_uri.authority().cloned();
+    let Ok(uri) = Uri::from_parts(uri_parts) else {
+        return http::Response::builder()
+            .status(http::StatusCode::BAD_REQUEST)
+            .body(http_body_util::Either::Left(http_body_util::Empty::new()))
+            .expect("http response to build");
     };
+    head.uri = uri;
 
-    let span = debug_span!("remote_request", destination = %url);
+    let req = http::Request::from_parts(head, body);
+
+    let span = debug_span!("remote_request", destination = %req.uri());
 
     async {
-        let request = state
-            .client
-            .request(head.method, url)
-            .body(reqwest::Body::wrap_stream(body.into_data_stream()))
-            .headers(head.headers)
-            .build()
-            .expect("http request to build");
-
-        let mut result = match state.client.execute(request).await {
+        let result = match state.client.get().request(req).await {
             Ok(result) => result,
             Err(err) => {
                 debug!(%err, "Failed to proxy request to Restate Cloud");
 
                 return http::Response::builder()
                     .status(http::StatusCode::BAD_GATEWAY)
-                    .body(axum::body::Body::empty())
+                    .body(http_body_util::Either::Left(http_body_util::Empty::new()))
                     .expect("http response to build");
             }
         };
 
-        let mut response = axum::http::Response::builder().status(result.status());
-        if let Some(headers) = response.headers_mut() {
-            std::mem::swap(headers, result.headers_mut())
-        };
-
-        let body = axum::body::Body::from_stream(result.bytes_stream());
-        let response = response.body(body).expect("http response to build");
-
         debug!(
-            status = response.status().as_u16(),
+            status = result.status().as_u16(),
             "Proxied request to Restate Cloud",
         );
-        response
+        result.map(http_body_util::Either::Right)
     }
     .instrument(span)
     .await
+}
+
+// https://httptoolkit.com/blog/translating-http-2-into-http-1/
+static BLOCK_HEADERS: [http::HeaderName; 6] = [
+    http::header::CONNECTION,
+    http::header::TRANSFER_ENCODING,
+    http::header::UPGRADE,
+    http::HeaderName::from_static("keep-alive"),
+    http::HeaderName::from_static("proxy-connection"),
+    http::HeaderName::from_static("http2-settings"),
+];
+
+fn remote_proxy_headers(headers: &mut http::HeaderMap, authorization: http::HeaderValue) {
+    let old_host = headers.remove(http::header::HOST);
+
+    for header in &BLOCK_HEADERS {
+        headers.remove(header);
+    }
+
+    // https://httptoolkit.com/blog/translating-http-2-into-http-1/
+    match headers.get(http::header::TE) {
+        Some(t) if t == "trailers" => {}
+        None => {}
+        _ => {
+            headers.remove(http::header::TE);
+        }
+    }
+
+    if let Some(old_host) = old_host {
+        headers.insert(http::HeaderName::from_static("x-forwarded-host"), old_host);
+    }
+
+    headers.insert(http::header::AUTHORIZATION, authorization);
 }
 
 #[derive(Clone, Copy, Serialize)]
@@ -482,31 +521,35 @@ async fn handle_tunnel_uri<Notify, Client, ClientError, ClientFuture, ResponseBo
     }
 }
 
-fn round_robin_client(
-    options: &Options,
+fn round_robin_client<B: hyper::body::Body + Send>(
+    count: NonZeroUsize,
     builder: &hyper_util::client::legacy::Builder,
     https_connector: &HttpsConnector<HttpConnector>,
-) -> RoundRobinClient {
+) -> RoundRobinClient<B>
+where
+    B::Data: Send,
+{
+    let count = count.get();
     // in order to avoid all traffic going to a single downstream destination:
     // - each tunnel server should have separate conn pool (this is similar to how different restate nodes would have different pools)
     // - in addition, we will give each server *multiple* http2 conns per pool (this is similar to separate partitions in restate having a conn each)
-    let mut clients = Vec::with_capacity(options.pools_per_tunnel.get());
+    let mut clients = Vec::with_capacity(count);
 
-    for _ in 0..options.pools_per_tunnel.get() {
+    for _ in 0..count {
         clients.push(builder.build(https_connector.clone()));
     }
 
     RoundRobinClient::new(clients)
 }
 
-struct RoundRobinClient {
-    clients: Vec<hyper_util::client::legacy::Client<HttpsConnector<HttpConnector>, Incoming>>,
+struct RoundRobinClient<B> {
+    clients: Vec<hyper_util::client::legacy::Client<HttpsConnector<HttpConnector>, B>>,
     index: AtomicUsize,
 }
 
-impl RoundRobinClient {
+impl<B> RoundRobinClient<B> {
     fn new(
-        clients: Vec<hyper_util::client::legacy::Client<HttpsConnector<HttpConnector>, Incoming>>,
+        clients: Vec<hyper_util::client::legacy::Client<HttpsConnector<HttpConnector>, B>>,
     ) -> Self {
         Self {
             clients,
@@ -514,54 +557,74 @@ impl RoundRobinClient {
         }
     }
 
-    fn get(&self) -> &hyper_util::client::legacy::Client<HttpsConnector<HttpConnector>, Incoming> {
+    fn get(&self) -> &hyper_util::client::legacy::Client<HttpsConnector<HttpConnector>, B> {
         let i = self.index.fetch_add(1, Ordering::Relaxed);
         &self.clients[i % self.clients.len()]
     }
 }
 
-async fn do_proxy(
-    client: hyper_util::client::legacy::Client<HttpsConnector<HttpConnector>, Incoming>,
+fn local_proxy(
+    http1_client: &hyper_util::client::legacy::Client<HttpsConnector<HttpConnector>, Incoming>,
+    http2_client: &RoundRobinClient<Incoming>,
     req: http::Request<Incoming>,
-) -> Result<
-    http::Response<
-        impl hyper::body::Body<Data = Bytes, Error = Box<dyn std::error::Error + Send + Sync>>
-        + Send
-        + Sync
-        + 'static,
+) -> impl Future<
+    Output = Result<
+        http::Response<
+            impl hyper::body::Body<Data = Bytes, Error = Box<dyn std::error::Error + Send + Sync>>
+            + Send
+            + Sync
+            + 'static
+            + use<>,
+        >,
+        hyper_util::client::legacy::Error,
     >,
-    hyper_util::client::legacy::Error,
-> {
-    let (mut req_parts, req_body) = req.into_parts();
-    let initial_uri = req_parts.uri.clone();
-    let uri_parts = req_parts.uri.into_parts();
+>
++ 'static
++ use<> {
+    let (mut head, body) = req.into_parts();
 
-    let Some(path_and_query) = uri_parts.path_and_query else {
-        warn!(uri = %initial_uri, "Tunnel request was missing path");
-        return Ok(http::Response::builder()
+    let Some(path_and_query) = head.uri.path_and_query() else {
+        warn!(uri = %head.uri, "Tunnel request was missing path");
+        return std::future::ready(Ok(http::Response::builder()
             .status(StatusCode::BAD_REQUEST)
             .body(http_body_util::Either::Left(http_body_util::Empty::new()))
-            .unwrap());
+            .unwrap()))
+        .left_future();
     };
 
     let destination = match parse_tunnel_destination(path_and_query) {
         Ok(destination) => destination,
         Err(message) => {
-            warn!(uri = %initial_uri, "Tunnel request had an invalid path ({})", message);
-            return Ok(http::Response::builder()
+            warn!(uri = %head.uri, "Tunnel request had an invalid path ({})", message);
+            return std::future::ready(Ok(http::Response::builder()
                 .status(StatusCode::BAD_REQUEST)
                 .body(http_body_util::Either::Left(http_body_util::Empty::new()))
-                .unwrap());
+                .unwrap()))
+            .left_future();
         }
     };
 
-    req_parts.uri = destination;
+    head.uri = destination;
 
-    let span = debug_span!("local_request", destination = %req_parts.uri);
-    let req = http::Request::from_parts(req_parts, req_body);
+    // use the http1.1 client for cleartext requests with x-restate-use-http11=true
+    let use_http11 = head.uri.scheme() != Some(&http::uri::Scheme::HTTPS)
+        && head.headers.get(USE_HTTP11) == Some(&http::HeaderValue::from_static("true"));
+
+    let client = if use_http11 {
+        head.version = http::Version::HTTP_11;
+        http1_client
+    } else {
+        http2_client.get()
+    };
+
+    let req = http::Request::from_parts(head, body);
+
+    let span = debug_span!("local_request", destination = %req.uri());
+
+    let fut = client.request(req);
 
     async move {
-        match client.request(req).await {
+        match fut.await {
             Ok(response) => {
                 debug!(
                     status = response.status().as_u16(),
@@ -580,13 +643,13 @@ async fn do_proxy(
         }
     }
     .instrument(span)
-    .await
+    .right_future()
 }
 
-fn parse_tunnel_destination(path_and_query: http::uri::PathAndQuery) -> Result<Uri, &'static str> {
-    let (_, path) = path_and_query
+fn parse_tunnel_destination(path_and_query: &http::uri::PathAndQuery) -> Result<Uri, &'static str> {
+    let path = path_and_query
         .path()
-        .split_once("/")
+        .strip_prefix('/')
         .ok_or("no leading /")?;
     let (scheme, path) = path.split_once("/").ok_or("no host")?;
     let scheme = http::uri::Scheme::from_str(scheme)
@@ -643,7 +706,7 @@ mod tests {
     fn test_parse_tunnel_destination_valid_http() {
         let path_and_query =
             PathAndQuery::from_static("/http/example.com/8080/api/v1/users?id=123");
-        let result = parse_tunnel_destination(path_and_query).unwrap();
+        let result = parse_tunnel_destination(&path_and_query).unwrap();
 
         assert_eq!(result.scheme_str(), Some("http"));
         assert_eq!(result.authority().unwrap().as_str(), "example.com:8080");
@@ -656,7 +719,7 @@ mod tests {
     #[test]
     fn test_parse_tunnel_destination_valid_https() {
         let path_and_query = PathAndQuery::from_static("/https/api.example.com/443/v2/data");
-        let result = parse_tunnel_destination(path_and_query).unwrap();
+        let result = parse_tunnel_destination(&path_and_query).unwrap();
 
         assert_eq!(result.scheme_str(), Some("https"));
         assert_eq!(result.authority().unwrap().as_str(), "api.example.com:443");
@@ -666,7 +729,7 @@ mod tests {
     #[test]
     fn test_parse_tunnel_destination_root_path() {
         let path_and_query = PathAndQuery::from_static("/http/localhost/3000");
-        let result = parse_tunnel_destination(path_and_query).unwrap();
+        let result = parse_tunnel_destination(&path_and_query).unwrap();
 
         assert_eq!(result.scheme_str(), Some("http"));
         assert_eq!(result.authority().unwrap().as_str(), "localhost:3000");
@@ -676,7 +739,7 @@ mod tests {
     #[test]
     fn test_parse_tunnel_destination_with_query_no_path() {
         let path_and_query = PathAndQuery::from_static("/https/example.com/443?query=value");
-        let result = parse_tunnel_destination(path_and_query).unwrap();
+        let result = parse_tunnel_destination(&path_and_query).unwrap();
 
         assert_eq!(result.scheme_str(), Some("https"));
         assert_eq!(result.authority().unwrap().as_str(), "example.com:443");
@@ -686,7 +749,7 @@ mod tests {
     #[test]
     fn test_parse_tunnel_destination_missing_leading_slash() {
         let path_and_query = PathAndQuery::from_static("http/example.com/8080/api");
-        let result = parse_tunnel_destination(path_and_query);
+        let result = parse_tunnel_destination(&path_and_query);
 
         assert_eq!(result, Err("no leading /"));
     }
@@ -694,7 +757,7 @@ mod tests {
     #[test]
     fn test_parse_tunnel_destination_no_host() {
         let path_and_query = PathAndQuery::from_static("/http");
-        let result = parse_tunnel_destination(path_and_query);
+        let result = parse_tunnel_destination(&path_and_query);
 
         assert_eq!(result, Err("no host"));
     }
@@ -702,7 +765,7 @@ mod tests {
     #[test]
     fn test_parse_tunnel_destination_invalid_scheme() {
         let path_and_query = PathAndQuery::from_static("/!/example.com/8080/api");
-        let result = parse_tunnel_destination(path_and_query);
+        let result = parse_tunnel_destination(&path_and_query);
 
         assert_eq!(result, Err("invalid scheme"));
     }
@@ -710,7 +773,7 @@ mod tests {
     #[test]
     fn test_parse_tunnel_destination_no_port() {
         let path_and_query = PathAndQuery::from_static("/http/example.com");
-        let result = parse_tunnel_destination(path_and_query);
+        let result = parse_tunnel_destination(&path_and_query);
 
         assert_eq!(result, Err("no port"));
     }
@@ -720,7 +783,7 @@ mod tests {
         let path_and_query = PathAndQuery::from_static(
             "/https/api.service.com/443/v1/users/123/posts?limit=10&offset=20",
         );
-        let result = parse_tunnel_destination(path_and_query).unwrap();
+        let result = parse_tunnel_destination(&path_and_query).unwrap();
 
         assert_eq!(result.scheme_str(), Some("https"));
         assert_eq!(result.authority().unwrap().as_str(), "api.service.com:443");

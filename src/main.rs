@@ -83,10 +83,22 @@ pub async fn main() -> anyhow::Result<()> {
     http_connector.set_nodelay(true);
     http_connector.set_connect_timeout(Some(options.connect_timeout));
 
-    let https_connector = hyper_rustls::HttpsConnectorBuilder::new()
+    let https_alpn_connector = hyper_rustls::HttpsConnectorBuilder::new()
         .with_tls_config(TLS_CLIENT_CONFIG.clone())
         .https_or_http()
         .enable_http1()
+        .enable_http2()
+        .wrap_connector(http_connector.clone());
+
+    let https_h1_connector = hyper_rustls::HttpsConnectorBuilder::new()
+        .with_tls_config(TLS_CLIENT_CONFIG.clone())
+        .https_or_http()
+        .enable_http1()
+        .wrap_connector(http_connector.clone());
+
+    let https_h2_connector = hyper_rustls::HttpsConnectorBuilder::new()
+        .with_tls_config(TLS_CLIENT_CONFIG.clone())
+        .https_or_http()
         .enable_http2()
         .wrap_connector(http_connector.clone());
 
@@ -95,8 +107,9 @@ pub async fn main() -> anyhow::Result<()> {
     let token = CancellationToken::new();
     let mut shutdown_fut = std::pin::pin!(shutdown());
 
+    let http1_or_http2_builder = builder.clone();
     // we can use a single http1.1 client as the connection reuse behaviour handles multiple ips well
-    let http1_builder = builder.clone();
+    let http1_client = http1_or_http2_builder.build(https_h1_connector);
     let http2_builder = builder.http2_only(true);
 
     {
@@ -135,7 +148,7 @@ pub async fn main() -> anyhow::Result<()> {
                 client: round_robin_client(
                     NonZeroUsize::new(6).unwrap(),
                     http2_builder,
-                    &https_connector,
+                    &https_alpn_connector,
                 ),
                 authorization: authorization.clone(),
             }));
@@ -164,7 +177,7 @@ pub async fn main() -> anyhow::Result<()> {
                 client: round_robin_client(
                     NonZeroUsize::new(6).unwrap(),
                     http2_builder,
-                    &https_connector,
+                    &https_alpn_connector,
                 ),
                 authorization,
             }));
@@ -221,13 +234,22 @@ pub async fn main() -> anyhow::Result<()> {
             let (status_send, status_recv) = watch::channel(TunnelStatus::Opening);
             let token = token.child_token();
 
-            let client =
-                round_robin_client(options.pools_per_tunnel, &http1_builder, &https_connector);
-            let http2_client =
-                round_robin_client(options.pools_per_tunnel, &http2_builder, &https_connector);
+            let alpn_client = round_robin_client(
+                options.pools_per_tunnel,
+                &http1_or_http2_builder,
+                &https_alpn_connector,
+            );
+            let http1_client = http1_client.clone();
+            let http2_client = round_robin_client(
+                options.pools_per_tunnel,
+                &http2_builder,
+                &https_h2_connector,
+            );
 
             let handler = Handler::<(), ()>::new(
-                hyper::service::service_fn(move |req| local_proxy(&client, &http2_client, req)),
+                hyper::service::service_fn(move |req| {
+                    local_proxy(&alpn_client, &http1_client, &http2_client, req)
+                }),
                 options.connect_timeout,
                 &options.environment_id,
                 &options.signing_public_key,
@@ -564,7 +586,8 @@ impl<B> RoundRobinClient<B> {
 }
 
 fn local_proxy(
-    client: &RoundRobinClient<Incoming>,
+    alpn_client: &RoundRobinClient<Incoming>,
+    http1_client: &hyper_util::client::legacy::Client<HttpsConnector<HttpConnector>, Incoming>,
     http2_client: &RoundRobinClient<Incoming>,
     req: http::Request<Incoming>,
 ) -> impl Future<
@@ -612,22 +635,29 @@ fn local_proxy(
             .get(HTTP_VERSION)
             .map(http::HeaderValue::as_bytes),
     ) {
-        // https urls will use an alpn client which supports http2 via alpn and http1.1
-        (Some("https"), _) => {
+        // https urls will use an alpn client which supports http2 via alpn and http1.1, unless the user requested a particular version
+        (Some("https"), None) => {
             // we don't want to force HTTP2 as we don't know if the destination accepts it
             // a request with HTTP_11 can still end up using h2 if the alpn agrees
             head.version = http::Version::HTTP_11;
-            client.get()
+            alpn_client.get()
         }
-        // cleartext requests, if the user requested http1.1, use it
-        (_, Some(b"HTTP/1.1")) => {
-            head.version = http::Version::HTTP_11;
-            client.get()
-        }
-        // cleartext requests where user requested h2, or didn't request a specific version; use http2 prior-knowledge
-        (_, Some(b"h2") | Some(b"h2c") | None) => {
+        // cleartext requests where the user didn't request a specific version; use http2 prior-knowledge
+        (_, None) => {
             head.version = http::Version::HTTP_2;
             http2_client.get()
+        }
+        // https or cleartext requests where the user requested http2; use http2
+        // prior-knowledge for cleartext, h2 in alpn otherwise
+        (_, Some(b"HTTP/2.0")) => {
+            head.version = http::Version::HTTP_2;
+            http2_client.get()
+        }
+        // https or cleartext requests where the user requested http1.1; use http1.1
+        // will not use h2 even if the alpn supports it
+        (_, Some(b"HTTP/1.1")) => {
+            head.version = http::Version::HTTP_11;
+            &http1_client
         }
         (_, Some(other)) => {
             warn!(uri = %head.uri, "Tunnel request had an invalid x-restate-tunnel-http-version ({})", String::from_utf8_lossy(other));

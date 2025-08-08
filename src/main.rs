@@ -139,63 +139,67 @@ pub async fn main() -> anyhow::Result<()> {
         authorization
     };
 
-    {
-        let router = axum::Router::new()
-            .fallback(remote_proxy)
-            .with_state(Arc::new(ProxyState {
-                base_uri: options.ingress_uri.clone(),
-                // for calls to restate cloud, we use 6 conns so we have a fair spread over the 3 nlb ips
-                client: round_robin_client(
-                    NonZeroUsize::new(6).unwrap(),
-                    http2_builder,
-                    &https_alpn_connector,
-                ),
-                authorization: authorization.clone(),
-            }));
+    if options.remote_proxy {
+        {
+            let router = axum::Router::new()
+                .fallback(remote_proxy)
+                .with_state(Arc::new(ProxyState {
+                    base_uri: options.ingress_uri.clone(),
+                    // for calls to restate cloud, we use 6 conns so we have a fair spread over the 3 nlb ips
+                    client: round_robin_client(
+                        NonZeroUsize::new(6).unwrap(),
+                        http2_builder,
+                        &https_alpn_connector,
+                    ),
+                    authorization: authorization.clone(),
+                }));
 
-        let server = axum::serve(
-            tokio::net::TcpListener::bind(options.ingress_serve_address).await?,
-            router.into_make_service(),
-        )
-        .with_graceful_shutdown(token.clone().cancelled_owned());
+            let server = axum::serve(
+                tokio::net::TcpListener::bind(options.ingress_serve_address).await?,
+                router.into_make_service(),
+            )
+            .with_graceful_shutdown(token.clone().cancelled_owned());
 
-        info!(
-            address = %options.ingress_serve_address,
-            destination = %options.ingress_uri,
-            "Serving ingress proxy endpoint"
-        );
+            info!(
+                address = %options.ingress_serve_address,
+                destination = %options.ingress_uri,
+                "Serving ingress proxy endpoint"
+            );
 
-        tokio::spawn(connections.track_future(server.into_future()));
-    };
+            tokio::spawn(connections.track_future(server.into_future()));
+        };
 
-    {
-        let router = axum::Router::new()
-            .fallback(remote_proxy)
-            .with_state(Arc::new(ProxyState {
-                base_uri: options.admin_uri.clone(),
-                // for calls to restate cloud, we use 6 conns so we have a fair spread over the 3 nlb ips
-                client: round_robin_client(
-                    NonZeroUsize::new(6).unwrap(),
-                    http2_builder,
-                    &https_alpn_connector,
-                ),
-                authorization,
-            }));
+        {
+            let router = axum::Router::new()
+                .fallback(remote_proxy)
+                .with_state(Arc::new(ProxyState {
+                    base_uri: options.admin_uri.clone(),
+                    // for calls to restate cloud, we use 6 conns so we have a fair spread over the 3 nlb ips
+                    client: round_robin_client(
+                        NonZeroUsize::new(6).unwrap(),
+                        http2_builder,
+                        &https_alpn_connector,
+                    ),
+                    authorization,
+                }));
 
-        let server = axum::serve(
-            tokio::net::TcpListener::bind(options.admin_serve_address).await?,
-            router.into_make_service(),
-        )
-        .with_graceful_shutdown(token.clone().cancelled_owned());
+            let server = axum::serve(
+                tokio::net::TcpListener::bind(options.admin_serve_address).await?,
+                router.into_make_service(),
+            )
+            .with_graceful_shutdown(token.clone().cancelled_owned());
 
-        info!(
-            address = %options.admin_serve_address,
-            destination = %options.admin_uri,
-            "Serving admin proxy endpoint"
-        );
+            info!(
+                address = %options.admin_serve_address,
+                destination = %options.admin_uri,
+                "Serving admin proxy endpoint"
+            );
 
-        tokio::spawn(connections.track_future(server.into_future()));
-    };
+            tokio::spawn(connections.track_future(server.into_future()));
+        };
+    } else {
+        info!("Not proxying local ports to Restate Cloud as RESTATE_REMOTE_PROXY is false");
+    }
 
     loop {
         let tunnel_servers = tokio::select! {
@@ -242,7 +246,7 @@ pub async fn main() -> anyhow::Result<()> {
             let http1_client = http1_client.clone();
             let http2_client = round_robin_client(
                 options.pools_per_tunnel,
-                &http2_builder,
+                http2_builder,
                 &https_h2_connector,
             );
 
@@ -657,7 +661,7 @@ fn local_proxy(
         // will not use h2 even if the alpn supports it
         (_, Some(b"HTTP/1.1")) => {
             head.version = http::Version::HTTP_11;
-            &http1_client
+            http1_client
         }
         (_, Some(other)) => {
             warn!(uri = %head.uri, "Tunnel request had an invalid x-restate-tunnel-http-version ({})", String::from_utf8_lossy(other));

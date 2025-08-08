@@ -2,8 +2,8 @@
 
 This repository manages a client intended to establish tunnelling connections from your compute infrastructure
 to your Restate Cloud environment, such that your environment can talk to Restate SDK services running in your
-private network. In addition, the client serves on ports 8080 and 9070, providing unauthenticated access to
-your Restate Cloud environment.
+private network. In addition, the client can serve on ports 8080 and 9070, providing unauthenticated access to
+your Restate Cloud environment (see 'Remote proxy' below).
 
 The client is primarily intended to be managed in Kubernetes by the [operator](https://github.com/restatedev/restate-operator), but it is possible to run it yourself if necessary.
 
@@ -22,6 +22,11 @@ restate dep register https://tunnel.us.restate.cloud:9080/201k0yd4rz8yftmd4awh1b
 ```
 
 You only need to build these URLs yourself if you're not using the operator.
+
+## Remote proxy
+In addition to exposing local services to Restate Cloud, by default the tunnel client will also serve unauthenticated ingress
+and admin endpoints from Restate Cloud on its local 8080 and 9080 ports. This behaviour can be disabled with `RESTATE_REMOTE_PROXY=false`. If left enabled, be careful to restrict access to these ports;
+access to them is equivalent to having the configured `RESTATE_BEARER_TOKEN`.
 
 ## Releasing
 1. Update the version in Cargo.{toml,lock} eg to 0.0.2

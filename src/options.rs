@@ -40,8 +40,11 @@ struct OptionsShadow {
     http_keep_alive_options: Http2KeepAliveOptions,
     shutdown_timeout: Duration,
     health_serve_address: SocketAddr,
+
+    remote_proxy: bool,
     ingress_serve_address: SocketAddr,
     admin_serve_address: SocketAddr,
+
     #[serde_as(as = "serde_with::DisplayFromStr")]
     cloud_suffix: hickory_resolver::Name,
     cloud_region: Option<String>,
@@ -66,6 +69,7 @@ impl Default for OptionsShadow {
             initial_max_send_streams: None,
             http_keep_alive_options: Http2KeepAliveOptions::default(),
             shutdown_timeout: Duration::from_secs(300),
+            remote_proxy: true,
             health_serve_address: SocketAddr::V4(SocketAddrV4::new([0, 0, 0, 0].into(), 9090)),
             ingress_serve_address: SocketAddr::V4(SocketAddrV4::new([0, 0, 0, 0].into(), 8080)),
             admin_serve_address: SocketAddr::V4(SocketAddrV4::new([0, 0, 0, 0].into(), 9070)),
@@ -92,6 +96,8 @@ pub struct Options {
     pub http_keep_alive_options: Http2KeepAliveOptions,
     pub shutdown_timeout: Duration,
     pub health_serve_address: SocketAddr,
+
+    pub remote_proxy: bool,
 
     pub ingress_serve_address: SocketAddr,
     pub ingress_uri: Uri,
@@ -235,6 +241,7 @@ impl Options {
             http_keep_alive_options: shadow.http_keep_alive_options,
             shutdown_timeout: shadow.shutdown_timeout,
             health_serve_address: shadow.health_serve_address,
+            remote_proxy: shadow.remote_proxy,
             ingress_serve_address: shadow.ingress_serve_address,
             ingress_uri,
             admin_serve_address: shadow.admin_serve_address,

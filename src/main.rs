@@ -6,7 +6,7 @@ use std::{
     str::FromStr,
     sync::{
         Arc, RwLock,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     time::Duration,
 };
@@ -112,25 +112,6 @@ pub async fn main() -> anyhow::Result<()> {
     let http1_client = http1_or_http2_builder.build(https_h1_connector);
     let http2_builder = builder.http2_only(true);
 
-    {
-        let router = axum::Router::new()
-            .route("/health", axum::routing::get(health))
-            .with_state(HealthState { uris: uris.clone() });
-
-        let server = axum::serve(
-            tokio::net::TcpListener::bind(options.health_serve_address).await?,
-            router.into_make_service(),
-        )
-        .with_graceful_shutdown(token.clone().cancelled_owned());
-
-        info!(
-            address = %options.health_serve_address,
-            "Serving health endpoint"
-        );
-
-        tokio::spawn(connections.track_future(server.into_future()));
-    };
-
     let authorization = {
         let authorization: &'static str =
             Box::leak(Box::<str>::from(format!("Bearer {}", options.bearer_token)));
@@ -201,6 +182,28 @@ pub async fn main() -> anyhow::Result<()> {
         info!("Not proxying local ports to Restate Cloud as RESTATE_REMOTE_PROXY is false");
     }
 
+    {
+        let router = axum::Router::new()
+            .route("/health", axum::routing::get(health))
+            .with_state(HealthState {
+                uris: uris.clone(),
+                started: Arc::new(AtomicBool::new(false)),
+            });
+
+        let server = axum::serve(
+            tokio::net::TcpListener::bind(options.health_serve_address).await?,
+            router.into_make_service(),
+        )
+        .with_graceful_shutdown(token.clone().cancelled_owned());
+
+        info!(
+            address = %options.health_serve_address,
+            "Serving health endpoint"
+        );
+
+        tokio::spawn(connections.track_future(server.into_future()));
+    };
+
     loop {
         let tunnel_servers = tokio::select! {
             _ = &mut shutdown_fut => {
@@ -244,11 +247,8 @@ pub async fn main() -> anyhow::Result<()> {
                 &https_alpn_connector,
             );
             let http1_client = http1_client.clone();
-            let http2_client = round_robin_client(
-                options.pools_per_tunnel,
-                http2_builder,
-                &https_h2_connector,
-            );
+            let http2_client =
+                round_robin_client(options.pools_per_tunnel, http2_builder, &https_h2_connector);
 
             let handler = Handler::<(), ()>::new(
                 hyper::service::service_fn(move |req| {
@@ -300,6 +300,7 @@ pub async fn main() -> anyhow::Result<()> {
 struct HealthState {
     #[allow(clippy::type_complexity)]
     uris: Arc<RwLock<HashMap<Uri, (CancellationToken, watch::Receiver<TunnelStatus>)>>>,
+    started: Arc<AtomicBool>,
 }
 
 #[serde_with::serde_as]
@@ -314,21 +315,31 @@ async fn health(
     match state.uris.read() {
         Ok(uris) => {
             let mut statuses = HashMap::new();
-            let mut all_open = true;
+            let mut one_open = false;
             for (uri, (_, receiver)) in uris.iter() {
                 let status = *receiver.borrow();
                 statuses.insert(uri.clone(), status);
-                if !matches!(status, TunnelStatus::Open) {
-                    all_open = false
+                if matches!(status, TunnelStatus::Open) {
+                    one_open = true
                 }
             }
-            if all_open && !statuses.is_empty() {
-                axum::Json(HealthOutput(statuses)).into_response()
+            let started = if one_open {
+                // consider the pod to have started if a single tunnel is open
+                state.started.store(true, Ordering::Relaxed);
+                true
             } else {
-                let mut resp = axum::Json(HealthOutput(statuses)).into_response();
+                // once we have started, we don't want to stop being ready because the tunnel servers are down
+                // otherwise our endpoints will stop getting published and we could break remote proxy outbound calls
+                state.started.load(Ordering::Relaxed)
+            };
+
+            let mut resp = axum::Json(HealthOutput(statuses)).into_response();
+
+            if !started {
                 *resp.status_mut() = http::StatusCode::INTERNAL_SERVER_ERROR;
-                resp
             }
+
+            resp
         }
         Err(_) => {
             let mut resp = "poisoned".into_response();

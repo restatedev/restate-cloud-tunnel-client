@@ -16,11 +16,11 @@ http-body-util = "0.1.3"
 hyper = "1.6.0"
 hyper-rustls = "0.27.7"
 hyper-util = "0.1.14"
-restate-cloud-tunnel-client = { git = "https://github.com/restatedev/restate.git", rev = "4d21d173713dc5374bab3318ab51ec8ac2769888", default-features = false }
-restate-types = { git = "https://github.com/restatedev/restate.git", rev = "4d21d173713dc5374bab3318ab51ec8ac2769888", default-features = false }
+restate-cloud-tunnel-client = { git = "https://github.com/restatedev/restate.git", rev = "69323d666cb61507dbb0c559d7ac97b305364d57", default-features = false }
+restate-types = { git = "https://github.com/restatedev/restate.git", rev = "69323d666cb61507dbb0c559d7ac97b305364d57", default-features = false }
 serde = "1.0.219"
 serde_with = "3.13.0"
-tokio = { version = "1.45.1", features = ["rt", "fs", "sync"] }
+tokio = { version = "1.47.1", features = ["rt", "fs", "sync"] }
 tokio-util = { version = "0.7.15", features = ["rt"] }
 tracing = "0.1.41"
 tracing-subscriber = { version = "0.3.19", features = ["json", "env-filter"]}

@@ -1,9 +1,9 @@
 
-FROM --platform=$BUILDPLATFORM ghcr.io/restatedev/dev-tools:latest AS planner
+FROM --platform=$BUILDPLATFORM ghcr.io/restatedev/dev-tools:1.14.4 AS planner
 COPY .. .
 RUN just chef-prepare
 
-FROM --platform=$BUILDPLATFORM ghcr.io/restatedev/dev-tools:latest AS base
+FROM --platform=$BUILDPLATFORM ghcr.io/restatedev/dev-tools:1.14.4 AS base
 COPY --from=planner /restate/recipe.json recipe.json
 COPY ../justfile justfile
 

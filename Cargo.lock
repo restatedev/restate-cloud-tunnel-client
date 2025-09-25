@@ -519,8 +519,8 @@ dependencies = [
 
 [[package]]
 name = "codederror"
-version = "1.5.0"
-source = "git+https://github.com/restatedev/restate.git?rev=affd9cbaeb8a21494b22493fb52b1c92503c311b#affd9cbaeb8a21494b22493fb52b1c92503c311b"
+version = "1.5.1-dev"
+source = "git+https://github.com/restatedev/restate.git?rev=69323d666cb61507dbb0c559d7ac97b305364d57#69323d666cb61507dbb0c559d7ac97b305364d57"
 dependencies = [
  "codederror-derive",
  "restate-workspace-hack",
@@ -529,7 +529,7 @@ dependencies = [
 [[package]]
 name = "codederror-derive"
 version = "0.1.0"
-source = "git+https://github.com/restatedev/restate.git?rev=affd9cbaeb8a21494b22493fb52b1c92503c311b#affd9cbaeb8a21494b22493fb52b1c92503c311b"
+source = "git+https://github.com/restatedev/restate.git?rev=69323d666cb61507dbb0c559d7ac97b305364d57#69323d666cb61507dbb0c559d7ac97b305364d57"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -2187,15 +2187,15 @@ checksum = "d05e27ee213611ffe7d6348b942e8f942b37114c00cc03cec254295a4a17852e"
 
 [[package]]
 name = "opentelemetry"
-version = "0.27.1"
+version = "0.30.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ab70038c28ed37b97d8ed414b6429d343a8bbf44c9f79ec854f3a643029ba6d7"
+checksum = "aaf416e4cb72756655126f7dd7bb0af49c674f4c1b9903e80c009e0c37e552e6"
 dependencies = [
  "futures-core",
  "futures-sink",
  "js-sys",
  "pin-project-lite",
- "thiserror 1.0.69",
+ "thiserror 2.0.12",
  "tracing",
 ]
 
@@ -2404,9 +2404,9 @@ dependencies = [
 
 [[package]]
 name = "prost"
-version = "0.13.5"
+version = "0.14.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2796faa41db3ec313a31f7624d9286acf277b52de526150b7e69f3debf891ee5"
+checksum = "7231bd9b3d3d33c86b58adbac74b5ec0ad9f496b19d22801d773636feaa95f3d"
 dependencies = [
  "bytes",
  "prost-derive",
@@ -2414,12 +2414,12 @@ dependencies = [
 
 [[package]]
 name = "prost-build"
-version = "0.13.5"
+version = "0.14.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "be769465445e8c1474e9c5dac2018218498557af32d9ed057325ec9a41ae81bf"
+checksum = "ac6c3320f9abac597dcbc668774ef006702672474aad53c6d596b62e487b40b1"
 dependencies = [
  "heck",
- "itertools 0.14.0",
+ "itertools 0.12.1",
  "log",
  "multimap",
  "once_cell",
@@ -2434,12 +2434,12 @@ dependencies = [
 
 [[package]]
 name = "prost-derive"
-version = "0.13.5"
+version = "0.14.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8a56d757972c98b346a9b766e3f02746cde6dd1cd1d1d563472929fdd74bec4d"
+checksum = "9120690fafc389a67ba3803df527d0ec9cbbc9cc45e4cc20b332996dfb672425"
 dependencies = [
  "anyhow",
- "itertools 0.14.0",
+ "itertools 0.12.1",
  "proc-macro2",
  "quote",
  "syn 2.0.104",
@@ -2481,9 +2481,9 @@ dependencies = [
 
 [[package]]
 name = "prost-types"
-version = "0.13.5"
+version = "0.14.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "52c2c1bf36ddb1a1c396b3601a3cec27c2462e45f07c386894ec3ccf5332bd16"
+checksum = "b9b4db3d6da204ed77bb26ba83b6122a73aeb2e87e25fbf7ad2e84c4ccbf8f72"
 dependencies = [
  "prost",
 ]
@@ -2636,8 +2636,8 @@ checksum = "95325155c684b1c89f7765e30bc1c42e4a6da51ca513615660cb8a62ef9a88e3"
 
 [[package]]
 name = "restate-base64-util"
-version = "1.5.0"
-source = "git+https://github.com/restatedev/restate.git?rev=affd9cbaeb8a21494b22493fb52b1c92503c311b#affd9cbaeb8a21494b22493fb52b1c92503c311b"
+version = "1.5.1-dev"
+source = "git+https://github.com/restatedev/restate.git?rev=69323d666cb61507dbb0c559d7ac97b305364d57#69323d666cb61507dbb0c559d7ac97b305364d57"
 dependencies = [
  "base64",
  "restate-workspace-hack",
@@ -2645,7 +2645,7 @@ dependencies = [
 
 [[package]]
 name = "restate-cloud-tunnel-client"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "anyhow",
  "axum",
@@ -2659,7 +2659,7 @@ dependencies = [
  "hyper",
  "hyper-rustls",
  "hyper-util",
- "restate-cloud-tunnel-client 1.5.0",
+ "restate-cloud-tunnel-client 1.5.1-dev",
  "restate-types",
  "serde",
  "serde_with",
@@ -2671,8 +2671,8 @@ dependencies = [
 
 [[package]]
 name = "restate-cloud-tunnel-client"
-version = "1.5.0"
-source = "git+https://github.com/restatedev/restate.git?rev=affd9cbaeb8a21494b22493fb52b1c92503c311b#affd9cbaeb8a21494b22493fb52b1c92503c311b"
+version = "1.5.1-dev"
+source = "git+https://github.com/restatedev/restate.git?rev=69323d666cb61507dbb0c559d7ac97b305364d57#69323d666cb61507dbb0c559d7ac97b305364d57"
 dependencies = [
  "anyhow",
  "bs58",
@@ -2695,8 +2695,8 @@ dependencies = [
 
 [[package]]
 name = "restate-encoding"
-version = "1.5.0"
-source = "git+https://github.com/restatedev/restate.git?rev=affd9cbaeb8a21494b22493fb52b1c92503c311b#affd9cbaeb8a21494b22493fb52b1c92503c311b"
+version = "1.5.1-dev"
+source = "git+https://github.com/restatedev/restate.git?rev=69323d666cb61507dbb0c559d7ac97b305364d57#69323d666cb61507dbb0c559d7ac97b305364d57"
 dependencies = [
  "bilrost",
  "bytes",
@@ -2708,7 +2708,7 @@ dependencies = [
 [[package]]
 name = "restate-encoding-derive"
 version = "0.1.0"
-source = "git+https://github.com/restatedev/restate.git?rev=affd9cbaeb8a21494b22493fb52b1c92503c311b#affd9cbaeb8a21494b22493fb52b1c92503c311b"
+source = "git+https://github.com/restatedev/restate.git?rev=69323d666cb61507dbb0c559d7ac97b305364d57#69323d666cb61507dbb0c559d7ac97b305364d57"
 dependencies = [
  "quote",
  "restate-workspace-hack",
@@ -2717,8 +2717,8 @@ dependencies = [
 
 [[package]]
 name = "restate-errors"
-version = "1.5.0"
-source = "git+https://github.com/restatedev/restate.git?rev=affd9cbaeb8a21494b22493fb52b1c92503c311b#affd9cbaeb8a21494b22493fb52b1c92503c311b"
+version = "1.5.1-dev"
+source = "git+https://github.com/restatedev/restate.git?rev=69323d666cb61507dbb0c559d7ac97b305364d57#69323d666cb61507dbb0c559d7ac97b305364d57"
 dependencies = [
  "codederror",
  "paste",
@@ -2728,8 +2728,8 @@ dependencies = [
 
 [[package]]
 name = "restate-serde-util"
-version = "1.5.0"
-source = "git+https://github.com/restatedev/restate.git?rev=affd9cbaeb8a21494b22493fb52b1c92503c311b#affd9cbaeb8a21494b22493fb52b1c92503c311b"
+version = "1.5.1-dev"
+source = "git+https://github.com/restatedev/restate.git?rev=69323d666cb61507dbb0c559d7ac97b305364d57#69323d666cb61507dbb0c559d7ac97b305364d57"
 dependencies = [
  "bytesize",
  "http",
@@ -2742,8 +2742,8 @@ dependencies = [
 
 [[package]]
 name = "restate-time-util"
-version = "1.5.0"
-source = "git+https://github.com/restatedev/restate.git?rev=affd9cbaeb8a21494b22493fb52b1c92503c311b#affd9cbaeb8a21494b22493fb52b1c92503c311b"
+version = "1.5.1-dev"
+source = "git+https://github.com/restatedev/restate.git?rev=69323d666cb61507dbb0c559d7ac97b305364d57#69323d666cb61507dbb0c559d7ac97b305364d57"
 dependencies = [
  "jiff",
  "restate-workspace-hack",
@@ -2756,8 +2756,8 @@ dependencies = [
 
 [[package]]
 name = "restate-types"
-version = "1.5.0"
-source = "git+https://github.com/restatedev/restate.git?rev=affd9cbaeb8a21494b22493fb52b1c92503c311b#affd9cbaeb8a21494b22493fb52b1c92503c311b"
+version = "1.5.1-dev"
+source = "git+https://github.com/restatedev/restate.git?rev=69323d666cb61507dbb0c559d7ac97b305364d57#69323d666cb61507dbb0c559d7ac97b305364d57"
 dependencies = [
  "ahash",
  "anyhow",
@@ -2842,8 +2842,8 @@ dependencies = [
 
 [[package]]
 name = "restate-utoipa"
-version = "1.5.0"
-source = "git+https://github.com/restatedev/restate.git?rev=affd9cbaeb8a21494b22493fb52b1c92503c311b#affd9cbaeb8a21494b22493fb52b1c92503c311b"
+version = "1.5.1-dev"
+source = "git+https://github.com/restatedev/restate.git?rev=69323d666cb61507dbb0c559d7ac97b305364d57#69323d666cb61507dbb0c559d7ac97b305364d57"
 dependencies = [
  "indexmap 2.10.0",
  "restate-workspace-hack",
@@ -3636,9 +3636,9 @@ checksum = "5d99f8c9a7727884afe522e9bd5edbfc91a3312b36a77b5fb8926e4c31a41801"
 
 [[package]]
 name = "tonic"
-version = "0.12.3"
+version = "0.14.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "877c5b330756d856ffcc4553ab34a5684481ade925ecc54bcd1bf02b1d0d4d52"
+checksum = "eb7613188ce9f7df5bfe185db26c5814347d110db17920415cf2fbcad85e7203"
 dependencies = [
  "base64",
  "bytes",
@@ -3647,6 +3647,7 @@ dependencies = [
  "http-body-util",
  "percent-encoding",
  "pin-project",
+ "sync_wrapper",
  "tokio-stream",
  "tower-layer",
  "tower-service",

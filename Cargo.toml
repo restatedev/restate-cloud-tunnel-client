@@ -13,14 +13,22 @@ futures = "0.3.31"
 hickory-resolver = "0.25.2"
 http = "1.3.1"
 http-body-util = "0.1.3"
-hyper = "1.6.0"
-hyper-rustls = "0.27.7"
+hyper = { version = "1.6.0", features = ["http2"] }
+hyper-rustls = { version = "0.27.7", default-features = false, features = [
+    "http1",
+    "http2",
+    "native-tokio",
+    "tls12",
+    "logging",
+] }
 hyper-util = "0.1.14"
-restate-cloud-tunnel-client = { git = "https://github.com/restatedev/restate.git", rev = "69323d666cb61507dbb0c559d7ac97b305364d57", default-features = false }
-restate-types = { git = "https://github.com/restatedev/restate.git", rev = "69323d666cb61507dbb0c559d7ac97b305364d57", default-features = false }
+restate-cloud-tunnel-client = { git = "https://github.com/restatedev/restate.git", rev = "27b78fcec996736a51b3ac6705652517c27da89e", default-features = false }
+restate-types = { git = "https://github.com/restatedev/restate.git", rev = "27b78fcec996736a51b3ac6705652517c27da89e", default-features = false }
+rustls = { version = "0.23", features = ["aws-lc-rs"]}
 serde = "1.0.219"
 serde_with = "3.13.0"
 tokio = { version = "1.47.1", features = ["rt", "fs", "sync"] }
 tokio-util = { version = "0.7.15", features = ["rt"] }
+tower = "0.5.2"
 tracing = "0.1.41"
 tracing-subscriber = { version = "0.3.19", features = ["json", "env-filter"]}

@@ -1,5 +1,5 @@
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     net::{Ipv6Addr, SocketAddr, SocketAddrV6},
     num::NonZeroUsize,
     path::{Path, PathBuf},
@@ -19,7 +19,7 @@ use serde::{Deserialize, Serialize};
 use serde_with::serde_as;
 use tracing::info;
 
-use crate::srv::{HickoryResolver, Resolver, fixed_uri_stream};
+use crate::srv::{HickoryResolver, Resolver, ServerName, fixed_uri_stream};
 
 #[serde_as]
 #[derive(Serialize, Deserialize)]
@@ -70,10 +70,25 @@ impl Default for OptionsShadow {
             http_keep_alive_options: Http2KeepAliveOptions::default(),
             shutdown_timeout: Duration::from_secs(300),
             remote_proxy: true,
-            health_serve_address: SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, 9090, 0, 0)),
-            ingress_serve_address: SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, 8080, 0, 0)),
-            admin_serve_address: SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, 9070, 0, 0)),
-            cloud_suffix: hickory_resolver::Name::from_str("restate.cloud")
+            health_serve_address: SocketAddr::V6(SocketAddrV6::new(
+                Ipv6Addr::UNSPECIFIED,
+                9090,
+                0,
+                0,
+            )),
+            ingress_serve_address: SocketAddr::V6(SocketAddrV6::new(
+                Ipv6Addr::UNSPECIFIED,
+                8080,
+                0,
+                0,
+            )),
+            admin_serve_address: SocketAddr::V6(SocketAddrV6::new(
+                Ipv6Addr::UNSPECIFIED,
+                9070,
+                0,
+                0,
+            )),
+            cloud_suffix: hickory_resolver::Name::from_str("restate.cloud.")
                 .expect("restate.cloud is a valid domain"),
             cloud_region: None,
             ingress_uri: None,
@@ -88,7 +103,7 @@ pub struct Options {
     pub bearer_token: String,
 
     pub tunnel_name: String,
-    pub tunnel_servers: BoxStream<'static, HashSet<Uri>>,
+    pub tunnel_servers: BoxStream<'static, HashMap<Uri, ServerName>>,
 
     pub connect_timeout: Duration,
     pub pools_per_tunnel: NonZeroUsize,
@@ -163,12 +178,25 @@ impl Options {
                     "Either 'tunnel_servers' (RESTATE_TUNNEL_SERVERS), 'tunnel_servers_srv' (RESTATE_TUNNEL_SERVERS_SRV) or 'cloud_region' (RESTATE_CLOUD_REGION) options must be provided"
                 );
             }
-            (Some(tunnel_servers), _, _) => fixed_uri_stream(tunnel_servers).boxed(),
+            (Some(tunnel_servers), _, _) => {
+                let tunnel_servers = tunnel_servers
+                    .into_iter()
+                    .map(|tunnel_server| {
+                        let host = tunnel_server
+                            .host()
+                            .context("tunnel_servers must have a host")?;
+                        let server_name = ServerName::from_str(host)
+                            .context("tunnel_servers hosts must be valid tls server names")?;
+                        Result::<_, anyhow::Error>::Ok((tunnel_server, server_name))
+                    })
+                    .collect::<Result<HashMap<_, _>, _>>()?;
+                fixed_uri_stream(tunnel_servers).boxed()
+            }
             (None, Some(tunnel_servers_srv), _) => {
                 let resolver = HickoryResolver::new();
 
                 // check once that it resolves
-                resolver.resolve(tunnel_servers_srv.clone()).await?;
+                resolver.resolve_srv(tunnel_servers_srv.clone()).await?;
 
                 resolver.into_stream(tunnel_servers_srv).boxed()
             }
@@ -181,7 +209,7 @@ impl Options {
                     .prepend_label("tunnel")?;
 
                 // check once that it resolves
-                resolver.resolve(tunnel_servers_srv.clone()).await?;
+                resolver.resolve_srv(tunnel_servers_srv.clone()).await?;
 
                 resolver.into_stream(tunnel_servers_srv).boxed()
             }

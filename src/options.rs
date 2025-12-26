@@ -1,6 +1,6 @@
 use std::{
     collections::HashSet,
-    net::{SocketAddr, SocketAddrV4},
+    net::{Ipv6Addr, SocketAddr, SocketAddrV6},
     num::NonZeroUsize,
     path::{Path, PathBuf},
     str::FromStr,
@@ -70,9 +70,9 @@ impl Default for OptionsShadow {
             http_keep_alive_options: Http2KeepAliveOptions::default(),
             shutdown_timeout: Duration::from_secs(300),
             remote_proxy: true,
-            health_serve_address: SocketAddr::V4(SocketAddrV4::new([0, 0, 0, 0].into(), 9090)),
-            ingress_serve_address: SocketAddr::V4(SocketAddrV4::new([0, 0, 0, 0].into(), 8080)),
-            admin_serve_address: SocketAddr::V4(SocketAddrV4::new([0, 0, 0, 0].into(), 9070)),
+            health_serve_address: SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, 9090, 0, 0)),
+            ingress_serve_address: SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, 8080, 0, 0)),
+            admin_serve_address: SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, 9070, 0, 0)),
             cloud_suffix: hickory_resolver::Name::from_str("restate.cloud")
                 .expect("restate.cloud is a valid domain"),
             cloud_region: None,

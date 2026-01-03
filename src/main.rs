@@ -5,7 +5,7 @@ use std::{
     path::PathBuf,
     str::FromStr,
     sync::{
-        Arc, RwLock,
+        Arc, LazyLock, RwLock,
         atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     time::Duration,
@@ -17,15 +17,15 @@ use clap::Parser;
 use futures::{FutureExt, StreamExt};
 use http::{Request, Response, StatusCode, Uri};
 use hyper::body::Incoming;
-use hyper_rustls::HttpsConnector;
+use hyper_rustls::{ConfigBuilderExt, HttpsConnector};
 use hyper_util::client::legacy::connect::HttpConnector;
-use restate_cloud_tunnel_client::client::{
-    Handler, HandlerNotification, ServeError, TLS_CLIENT_CONFIG,
-};
+use restate_cloud_tunnel_client::client::{Handler, HandlerNotification, ServeError};
 use restate_types::retries::RetryPolicy;
+use rustls::ClientConfig;
 use serde::Serialize;
 use tokio::sync::watch;
 use tokio_util::{sync::CancellationToken, task::TaskTracker};
+use tower::Service;
 use tracing::{Instrument, debug, debug_span, error, info, info_span, warn};
 use tracing_subscriber::filter::LevelFilter;
 
@@ -37,6 +37,15 @@ mod srv;
 
 const HTTP_VERSION: http::HeaderName =
     http::HeaderName::from_static("x-restate-tunnel-http-version");
+
+pub static TLS_CLIENT_CONFIG: LazyLock<ClientConfig> = LazyLock::new(|| {
+    ClientConfig::builder_with_provider(Arc::new(rustls::crypto::aws_lc_rs::default_provider()))
+        .with_protocol_versions(rustls::DEFAULT_VERSIONS)
+        .expect("default versions are supported")
+        .with_native_roots()
+        .expect("Can load native certificates")
+        .with_no_client_auth()
+});
 
 #[derive(Debug, clap::Parser)]
 struct Arguments {
@@ -82,6 +91,8 @@ pub async fn main() -> anyhow::Result<()> {
     http_connector.enforce_http(false);
     http_connector.set_nodelay(true);
     http_connector.set_connect_timeout(Some(options.connect_timeout));
+    // default interval on linux is 75 secs, also use this as the start-after
+    http_connector.set_keepalive(Some(Duration::from_secs(75)));
 
     let https_alpn_connector = hyper_rustls::HttpsConnectorBuilder::new()
         .with_tls_config(TLS_CLIENT_CONFIG.clone())
@@ -221,7 +232,7 @@ pub async fn main() -> anyhow::Result<()> {
             let uris_read = uris.read().unwrap();
             if tunnel_servers
                 .iter()
-                .all(|server| uris_read.contains_key(server))
+                .all(|(server, _)| uris_read.contains_key(server))
                 && tunnel_servers.len() == uris_read.len()
             {
                 // don't bother taking a write lock if there is no change in the tunnels
@@ -231,12 +242,12 @@ pub async fn main() -> anyhow::Result<()> {
 
         let mut uris = uris.write().unwrap();
 
-        for server in &tunnel_servers {
+        for (server, server_name) in &tunnel_servers {
             if uris.contains_key(server) {
                 continue;
             }
 
-            info!(%server, "Starting new tunnel");
+            info!(%server, %server_name, "Starting new tunnel");
 
             let (status_send, status_recv) = watch::channel(TunnelStatus::Opening);
             let token = token.child_token();
@@ -250,11 +261,19 @@ pub async fn main() -> anyhow::Result<()> {
             let http2_client =
                 round_robin_client(options.pools_per_tunnel, http2_builder, &https_h2_connector);
 
+            let https_connector = hyper_rustls::HttpsConnectorBuilder::new()
+                .with_tls_config(TLS_CLIENT_CONFIG.clone())
+                .https_or_http()
+                .with_server_name_resolver(hyper_rustls::FixedServerNameResolver::new(
+                    server_name.clone().into(),
+                ))
+                .enable_http2()
+                .wrap_connector(http_connector.clone());
+
             let handler = Handler::<(), ()>::new(
                 hyper::service::service_fn(move |req| {
                     local_proxy(&alpn_client, &http1_client, &http2_client, req)
                 }),
-                options.connect_timeout,
                 &options.environment_id,
                 &options.signing_public_key,
                 &options.bearer_token,
@@ -263,15 +282,21 @@ pub async fn main() -> anyhow::Result<()> {
             )
             .expect("failed to create tunnel handler");
 
-            let fut = handle_tunnel_uri(handler, token.clone(), status_send, server.clone())
-                .instrument(info_span!("tunnel", server = %server).or_current());
+            let fut = handle_tunnel_uri(
+                handler,
+                https_connector,
+                token.clone(),
+                status_send,
+                server.clone(),
+            )
+            .instrument(info_span!("tunnel", %server, %server_name).or_current());
 
             tokio::spawn(connections.track_future(fut));
             uris.insert(server.clone(), (token, status_recv));
         }
 
         uris.retain(|existing_uri, (token, _)| {
-            if !tunnel_servers.contains(existing_uri) {
+            if !tunnel_servers.contains_key(existing_uri) {
                 info!(server = %existing_uri, "Tearing down tunnel");
 
                 token.cancel();
@@ -449,6 +474,7 @@ enum TunnelStatus {
 
 async fn handle_tunnel_uri<Notify, Client, ClientError, ClientFuture, ResponseBody>(
     handler: Handler<Notify, Client>,
+    https_connector: HttpsConnector<HttpConnector>,
     token: CancellationToken,
     status: watch::Sender<TunnelStatus>,
     server: Uri,
@@ -480,11 +506,30 @@ async fn handle_tunnel_uri<Notify, Client, ClientError, ClientFuture, ResponseBo
 
     loop {
         let handler = handler.clone();
-        let server = server.clone();
         let on_drain = CancellationToken::new();
 
         info!("Establishing tunnel connection");
-        let mut handle = tokio::spawn(handler.serve(server, token.child_token(), on_drain.clone()));
+        let mut handle = tokio::spawn({
+            let mut https_connector = https_connector.clone();
+            let server = server.clone();
+            let cancel = token.child_token();
+            let on_drain = on_drain.clone();
+            async move {
+                let io = tokio::select! {
+                     io_result = https_connector.call(server) => {
+                         match io_result {
+                             Ok(io) => io,
+                             Err(err) => return ServeError::Connection(err),
+                         }
+                     }
+                     _ = cancel.cancelled() => {
+                         return ServeError::ClientClosed("connecting to tunnel")
+                     }
+                };
+
+                handler.serve(io, cancel, on_drain).await
+            }
+        });
         // default connect timeout 5s, tunnel handshake timeout 5s
         let mut opened_after = std::pin::pin!(tokio::time::sleep(Duration::from_secs(15)));
         let mut opened = false;

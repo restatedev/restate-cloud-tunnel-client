@@ -47,7 +47,8 @@ struct OptionsShadow {
 
     #[serde_as(as = "serde_with::DisplayFromStr")]
     cloud_suffix: hickory_resolver::Name,
-    cloud_region: Option<String>,
+    #[serde_as(as = "Option<serde_with::DisplayFromStr>")]
+    cloud_region: Option<hickory_resolver::Name>,
     #[serde_as(as = "Option<serde_with::DisplayFromStr>")]
     ingress_uri: Option<Uri>,
     #[serde_as(as = "Option<serde_with::DisplayFromStr>")]
@@ -203,10 +204,11 @@ impl Options {
             (None, None, Some(cloud_region)) => {
                 let resolver = HickoryResolver::new();
 
-                let tunnel_servers_srv = shadow
-                    .cloud_suffix
-                    .prepend_label(cloud_region.clone())?
-                    .prepend_label("tunnel")?;
+                let mut tunnel_servers_srv = shadow.cloud_suffix.clone();
+                for region_part in cloud_region.iter().rev() {
+                    tunnel_servers_srv = tunnel_servers_srv.prepend_label(region_part)?;
+                }
+                tunnel_servers_srv = tunnel_servers_srv.prepend_label("tunnel")?;
 
                 // check once that it resolves
                 resolver.resolve_srv(tunnel_servers_srv.clone()).await?;
@@ -226,9 +228,11 @@ impl Options {
                 let unprefixed_environment_id = environment_id
                     .strip_prefix("env_")
                     .unwrap_or(&environment_id);
-                let ingress_name = shadow
-                    .cloud_suffix
-                    .prepend_label(cloud_region.clone())?
+                let mut ingress_name = shadow.cloud_suffix.clone();
+                for region_part in cloud_region.iter().rev() {
+                    ingress_name = ingress_name.prepend_label(region_part)?;
+                }
+                ingress_name = ingress_name
                     .prepend_label("env")?
                     .prepend_label(unprefixed_environment_id)?;
 
@@ -247,9 +251,11 @@ impl Options {
                 let unprefixed_environment_id = environment_id
                     .strip_prefix("env_")
                     .unwrap_or(&environment_id);
-                let admin_name = shadow
-                    .cloud_suffix
-                    .prepend_label(cloud_region.clone())?
+                let mut admin_name = shadow.cloud_suffix.clone();
+                for region_part in cloud_region.iter().rev() {
+                    admin_name = admin_name.prepend_label(region_part)?;
+                }
+                admin_name = admin_name
                     .prepend_label("env")?
                     .prepend_label(unprefixed_environment_id)?;
 

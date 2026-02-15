@@ -14,7 +14,7 @@ use std::{
 use axum::response::IntoResponse;
 use bytes::{BufMut, Bytes, BytesMut};
 use clap::Parser;
-use futures::{FutureExt, StreamExt};
+use futures::{FutureExt, StreamExt, TryFutureExt};
 use http::{Request, Response, StatusCode, Uri};
 use hyper::body::Incoming;
 use hyper_rustls::{ConfigBuilderExt, HttpsConnector};
@@ -23,14 +23,19 @@ use restate_cloud_tunnel_client::client::{Handler, HandlerNotification, ServeErr
 use restate_types::retries::RetryPolicy;
 use rustls::ClientConfig;
 use serde::Serialize;
-use tokio::sync::watch;
+use tokio::sync::{oneshot, watch};
 use tokio_util::{sync::CancellationToken, task::TaskTracker};
 use tower::Service;
 use tracing::{Instrument, debug, debug_span, error, info, info_span, warn};
 use tracing_subscriber::filter::LevelFilter;
 
-use crate::{options::Options, signal::shutdown};
+use crate::{
+    metrics::{METRICS, TunnelMetrics},
+    options::Options,
+    signal::shutdown,
+};
 
+mod metrics;
 mod options;
 mod signal;
 mod srv;
@@ -196,6 +201,7 @@ pub async fn main() -> anyhow::Result<()> {
     {
         let router = axum::Router::new()
             .route("/health", axum::routing::get(health))
+            .route("/metrics", axum::routing::get(metrics_endpoint))
             .with_state(HealthState {
                 uris: uris.clone(),
                 started: Arc::new(AtomicBool::new(false)),
@@ -282,12 +288,16 @@ pub async fn main() -> anyhow::Result<()> {
             )
             .expect("failed to create tunnel handler");
 
+            let tunnel_metrics =
+                METRICS.tunnel(server.authority().map(|a| a.as_str()).unwrap_or_default());
+
             let fut = handle_tunnel_uri(
                 handler,
                 https_connector,
                 token.clone(),
                 status_send,
                 server.clone(),
+                tunnel_metrics,
             )
             .instrument(info_span!("tunnel", %server, %server_name).or_current());
 
@@ -298,7 +308,12 @@ pub async fn main() -> anyhow::Result<()> {
         uris.retain(|existing_uri, (token, _)| {
             if !tunnel_servers.contains_key(existing_uri) {
                 info!(server = %existing_uri, "Tearing down tunnel");
-
+                METRICS.remove_tunnel(
+                    existing_uri
+                        .authority()
+                        .map(|a| a.as_str())
+                        .unwrap_or_default(),
+                );
                 token.cancel();
                 false
             } else {
@@ -374,6 +389,13 @@ async fn health(
     }
 }
 
+async fn metrics_endpoint() -> impl IntoResponse {
+    (
+        [(http::header::CONTENT_TYPE, "text/plain; version=0.0.4")],
+        METRICS.render(),
+    )
+}
+
 struct ProxyState {
     base_uri: Uri,
     client: RoundRobinClient<axum::body::Body>,
@@ -413,6 +435,7 @@ async fn remote_proxy(
             Ok(result) => result,
             Err(err) => {
                 debug!(%err, "Failed to proxy request to Restate Cloud");
+                METRICS.record_remote_proxy_request(false);
 
                 return http::Response::builder()
                     .status(http::StatusCode::BAD_GATEWAY)
@@ -421,6 +444,7 @@ async fn remote_proxy(
             }
         };
 
+        METRICS.record_remote_proxy_request(true);
         debug!(
             status = result.status().as_u16(),
             "Proxied request to Restate Cloud",
@@ -478,6 +502,7 @@ async fn handle_tunnel_uri<Notify, Client, ClientError, ClientFuture, ResponseBo
     token: CancellationToken,
     status: watch::Sender<TunnelStatus>,
     server: Uri,
+    metrics: TunnelMetrics,
 ) where
     Notify: Fn(HandlerNotification) + Send + Sync + 'static,
     Client: hyper::service::Service<
@@ -504,11 +529,18 @@ async fn handle_tunnel_uri<Notify, Client, ClientError, ClientFuture, ResponseBo
 
     let mut retry_iter = retry_policy.clone().into_iter();
 
+    metrics.opened(false);
+    metrics.draining(false);
+
     loop {
         let handler = handler.clone();
         let on_drain = CancellationToken::new();
 
         info!("Establishing tunnel connection");
+        metrics.inc_connection_attempts();
+
+        let (connected_tx, connected_rx) = oneshot::channel::<()>();
+
         let mut handle = tokio::spawn({
             let mut https_connector = https_connector.clone();
             let server = server.clone();
@@ -527,17 +559,23 @@ async fn handle_tunnel_uri<Notify, Client, ClientError, ClientFuture, ResponseBo
                      }
                 };
 
+                let _ = connected_tx.send(());
+
                 handler.serve(io, cancel, on_drain).await
             }
         });
-        // default connect timeout 5s, tunnel handshake timeout 5s
-        let mut opened_after = std::pin::pin!(tokio::time::sleep(Duration::from_secs(15)));
+        // we treat the tunnel as opened 5s after the connection is open, as the handshake timeout is 5s
+        let mut opened_after = std::pin::pin!(
+            connected_rx
+                .and_then(|_| async { Ok(tokio::time::sleep(Duration::from_secs(5)).await) })
+        );
         let mut opened = false;
 
         loop {
             tokio::select! {
-                _ = &mut opened_after, if !opened => {
+                Ok(()) = &mut opened_after, if !opened => {
                     let _ = status.send(TunnelStatus::Open);
+                    metrics.opened(true);
                     opened = true;
                 }
                 err = &mut handle => {
@@ -557,6 +595,8 @@ async fn handle_tunnel_uri<Notify, Client, ClientError, ClientFuture, ResponseBo
                     break
                 }
                 _ = on_drain.cancelled() => {
+                    metrics.draining(true);
+                    let metrics = metrics.clone();
                     tokio::task::spawn(async move {
                         match tokio::time::timeout(Duration::from_secs(120), &mut handle).await {
                             Ok(Ok(ServeError::ClientClosed(status))) => {
@@ -577,6 +617,7 @@ async fn handle_tunnel_uri<Notify, Client, ClientError, ClientFuture, ResponseBo
                                 warn!("Server sent a drain notification but the tunnel did not exit in time");
                             }
                         }
+                        metrics.draining(false);
                     }.in_current_span());
                     info!("Server requested drain; starting new tunnel connection");
                     break
@@ -589,6 +630,7 @@ async fn handle_tunnel_uri<Notify, Client, ClientError, ClientFuture, ResponseBo
             retry_iter = retry_policy.clone().into_iter();
         }
 
+        metrics.opened(false);
         let _ = status.send(TunnelStatus::BackingOff);
 
         tokio::select! {
@@ -738,6 +780,7 @@ fn local_proxy(
     async move {
         match fut.await {
             Ok(response) => {
+                METRICS.record_local_proxy_request(true);
                 debug!(
                     status = response.status().as_u16(),
                     "Proxied request from Restate Cloud"
@@ -745,6 +788,7 @@ fn local_proxy(
                 Ok(response.map(http_body_util::Either::Right))
             }
             Err(err) => {
+                METRICS.record_local_proxy_request(false);
                 error!(%err, "Failed to proxy request from Restate Cloud");
 
                 Ok(http::Response::builder()

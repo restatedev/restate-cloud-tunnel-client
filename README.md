@@ -11,7 +11,7 @@ The tunnel client must be configured with the following values:
 - `RESTATE_TUNNEL_NAME`: a name representing the tunnel connection; you might use the name of the cluster in which the client runs.
 - `RESTATE_ENVIRONMENT_ID`: the ID of the environment you want to tunnel to
 - `RESTATE_SIGNING_PUBLIC_KEY`: the signing public key of your Restate Cloud environment. This allows the client to validate that incoming requests come from your environment.
-- `RESTATE_BEARER_TOKEN`: a Restate Cloud API key with the `Full` role.
+- `RESTATE_AUTH_TOKEN` (formerly `RESTATE_BEARER_TOKEN`, still accepted): a Restate Cloud API key with the `Full` role.
 - `RESTATE_CLOUD_REGION`: The id of the Restate Cloud region in which your environment runs ie `us` or `eu`.
 
 Once running, your Cloud environment can register services at urls like `https://tunnel.$RESTATE_CLOUD_REGION.restate.cloud/$UNPREFIXED_RESTATE_ENVIRONMENT_ID/$RESTATE_TUNNEL_NAME/http/your-service-dns/9080`
@@ -26,7 +26,7 @@ You only need to build these URLs yourself if you're not using the operator.
 ## Remote proxy
 In addition to exposing local services to Restate Cloud, by default the tunnel client will also serve unauthenticated ingress
 and admin endpoints from Restate Cloud on its local 8080 and 9080 ports. This behaviour can be disabled with `RESTATE_REMOTE_PROXY=false`. If left enabled, be careful to restrict access to these ports;
-access to them is equivalent to having the configured `RESTATE_BEARER_TOKEN`.
+access to them is equivalent to having the configured `RESTATE_AUTH_TOKEN`.
 
 ## Releasing
 1. Update the version in Cargo.{toml,lock} eg to 0.0.2

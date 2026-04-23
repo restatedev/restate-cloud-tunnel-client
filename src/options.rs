@@ -32,8 +32,10 @@ struct OptionsShadow {
     tunnel_servers: Option<HashSet<Uri>>,
     #[serde_as(as = "Option<serde_with::DisplayFromStr>")]
     tunnel_servers_srv: Option<hickory_resolver::Name>,
-    bearer_token: Option<String>,
-    bearer_token_file: Option<PathBuf>,
+    #[serde(alias = "bearer-token", skip_serializing_if = "Option::is_none")]
+    auth_token: Option<String>,
+    #[serde(alias = "bearer-token-file", skip_serializing_if = "Option::is_none")]
+    auth_token_file: Option<PathBuf>,
     connect_timeout: Duration,
     pools_per_tunnel: NonZeroUsize,
     initial_max_send_streams: Option<usize>,
@@ -63,8 +65,8 @@ impl Default for OptionsShadow {
             tunnel_name: None,
             tunnel_servers: None,
             tunnel_servers_srv: None,
-            bearer_token: None,
-            bearer_token_file: None,
+            auth_token: None,
+            auth_token_file: None,
             connect_timeout: Duration::from_secs(5),
             pools_per_tunnel: NonZeroUsize::new(16).unwrap(),
             initial_max_send_streams: None,
@@ -101,7 +103,7 @@ impl Default for OptionsShadow {
 pub struct Options {
     pub environment_id: String,
     pub signing_public_key: String,
-    pub bearer_token: String,
+    pub auth_token: String,
 
     pub tunnel_name: String,
     pub tunnel_servers: BoxStream<'static, HashMap<Uri, ServerName>>,
@@ -129,6 +131,21 @@ impl Options {
         // Load configuration file
         figment = figment.merge(Toml::file(path));
 
+        if std::env::var_os("RESTATE_AUTH_TOKEN").is_some()
+            && std::env::var_os("RESTATE_BEARER_TOKEN").is_some()
+        {
+            bail!(
+                "Both RESTATE_AUTH_TOKEN and RESTATE_BEARER_TOKEN are set; unset RESTATE_BEARER_TOKEN (deprecated alias for RESTATE_AUTH_TOKEN)"
+            );
+        }
+        if std::env::var_os("RESTATE_AUTH_TOKEN_FILE").is_some()
+            && std::env::var_os("RESTATE_BEARER_TOKEN_FILE").is_some()
+        {
+            bail!(
+                "Both RESTATE_AUTH_TOKEN_FILE and RESTATE_BEARER_TOKEN_FILE are set; unset RESTATE_BEARER_TOKEN_FILE (deprecated alias for RESTATE_AUTH_TOKEN_FILE)"
+            );
+        }
+
         figment = figment.merge(
             Env::prefixed("RESTATE_")
                 .split("__")
@@ -137,23 +154,23 @@ impl Options {
 
         let shadow: OptionsShadow = figment.extract()?;
 
-        let bearer_token = match (shadow.bearer_token, shadow.bearer_token_file) {
+        let auth_token = match (shadow.auth_token, shadow.auth_token_file) {
             (None, None) => {
                 bail!(
-                    "Either 'bearer_token' (RESTATE_BEARER_TOKEN) or 'bearer_token_file' (RESTATE_BEARER_TOKEN_FILE) options must be provided"
+                    "Either 'auth_token' (RESTATE_AUTH_TOKEN) or 'auth_token_file' (RESTATE_AUTH_TOKEN_FILE) options must be provided"
                 );
             }
-            (Some(bearer_token), _) => bearer_token,
-            (None, Some(bearer_token_file)) => {
-                let mut bearer_token = tokio::fs::read_to_string(&bearer_token_file)
+            (Some(auth_token), _) => auth_token,
+            (None, Some(auth_token_file)) => {
+                let mut auth_token = tokio::fs::read_to_string(&auth_token_file)
                     .await
-                    .context("failed to read bearer token file")?;
-                bearer_token.truncate(bearer_token.trim_end().len());
+                    .context("failed to read auth token file")?;
+                auth_token.truncate(auth_token.trim_end().len());
                 info!(
-                    "Loaded initial bearer token from {}",
-                    bearer_token_file.display()
+                    "Loaded initial auth token from {}",
+                    auth_token_file.display()
                 );
-                bearer_token
+                auth_token
             }
         };
 
@@ -268,7 +285,7 @@ impl Options {
             signing_public_key,
             tunnel_name,
             tunnel_servers,
-            bearer_token,
+            auth_token,
             connect_timeout: shadow.connect_timeout,
             pools_per_tunnel: shadow.pools_per_tunnel,
             initial_max_send_streams: shadow.initial_max_send_streams,

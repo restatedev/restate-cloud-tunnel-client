@@ -130,7 +130,7 @@ pub async fn main() -> anyhow::Result<()> {
 
     let authorization = {
         let authorization: &'static str =
-            Box::leak(Box::<str>::from(format!("Bearer {}", options.bearer_token)));
+            Box::leak(Box::<str>::from(format!("Bearer {}", options.auth_token)));
         let mut authorization = http::HeaderValue::from_static(authorization);
         authorization.set_sensitive(true);
         authorization
@@ -282,7 +282,7 @@ pub async fn main() -> anyhow::Result<()> {
                 }),
                 &options.environment_id,
                 &options.signing_public_key,
-                &options.bearer_token,
+                &options.auth_token,
                 Some(options.tunnel_name.clone()),
                 Option::<fn(_)>::None,
             )

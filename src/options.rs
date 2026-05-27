@@ -43,7 +43,10 @@ struct OptionsShadow {
     shutdown_timeout: Duration,
     health_serve_address: SocketAddr,
 
-    remote_proxy: bool,
+    #[serde(alias = "remote-proxy", skip_serializing_if = "Option::is_none")]
+    environment_proxy: Option<bool>,
+    environment_proxy_connections: NonZeroUsize,
+    tunnel_server_connections: NonZeroUsize,
     ingress_serve_address: SocketAddr,
     admin_serve_address: SocketAddr,
 
@@ -72,7 +75,10 @@ impl Default for OptionsShadow {
             initial_max_send_streams: None,
             http_keep_alive_options: Http2KeepAliveOptions::default(),
             shutdown_timeout: Duration::from_secs(300),
-            remote_proxy: true,
+            environment_proxy: None,
+            // Preserve the previous hard-coded fan-out for spreading over cloud NLB IPs.
+            environment_proxy_connections: NonZeroUsize::new(6).unwrap(),
+            tunnel_server_connections: NonZeroUsize::new(1).unwrap(),
             health_serve_address: SocketAddr::V6(SocketAddrV6::new(
                 Ipv6Addr::UNSPECIFIED,
                 9090,
@@ -115,7 +121,9 @@ pub struct Options {
     pub shutdown_timeout: Duration,
     pub health_serve_address: SocketAddr,
 
-    pub remote_proxy: bool,
+    pub environment_proxy: bool,
+    pub environment_proxy_connections: NonZeroUsize,
+    pub tunnel_server_connections: NonZeroUsize,
 
     pub ingress_serve_address: SocketAddr,
     pub ingress_uri: Uri,
@@ -145,12 +153,25 @@ impl Options {
                 "Both RESTATE_AUTH_TOKEN_FILE and RESTATE_BEARER_TOKEN_FILE are set; unset RESTATE_BEARER_TOKEN_FILE (deprecated alias for RESTATE_AUTH_TOKEN_FILE)"
             );
         }
+        if std::env::var_os("RESTATE_ENVIRONMENT_PROXY").is_some()
+            && std::env::var_os("RESTATE_REMOTE_PROXY").is_some()
+        {
+            bail!(
+                "Both RESTATE_ENVIRONMENT_PROXY and RESTATE_REMOTE_PROXY are set; unset RESTATE_REMOTE_PROXY (deprecated alias for RESTATE_ENVIRONMENT_PROXY)"
+            );
+        }
 
         figment = figment.merge(
             Env::prefixed("RESTATE_")
                 .split("__")
                 .map(|k| k.as_str().replace('_', "-").into()),
         );
+
+        if figment.contains("environment-proxy") && figment.contains("remote-proxy") {
+            bail!(
+                "Both 'environment-proxy' and 'remote-proxy' are set; unset 'remote-proxy' (deprecated alias for 'environment-proxy')"
+            );
+        }
 
         let shadow: OptionsShadow = figment.extract()?;
 
@@ -292,11 +313,225 @@ impl Options {
             http_keep_alive_options: shadow.http_keep_alive_options,
             shutdown_timeout: shadow.shutdown_timeout,
             health_serve_address: shadow.health_serve_address,
-            remote_proxy: shadow.remote_proxy,
+            environment_proxy: shadow.environment_proxy.unwrap_or(true),
+            environment_proxy_connections: shadow.environment_proxy_connections,
+            tunnel_server_connections: shadow.tunnel_server_connections,
             ingress_serve_address: shadow.ingress_serve_address,
             ingress_uri,
             admin_serve_address: shadow.admin_serve_address,
             admin_uri,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        env,
+        ffi::OsString,
+        sync::{Mutex, MutexGuard},
+    };
+
+    use super::*;
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    const TEST_ENV_KEYS: &[&str] = &[
+        "RESTATE_ADMIN_URI",
+        "RESTATE_AUTH_TOKEN",
+        "RESTATE_AUTH_TOKEN_FILE",
+        "RESTATE_BEARER_TOKEN",
+        "RESTATE_BEARER_TOKEN_FILE",
+        "RESTATE_CLOUD_REGION",
+        "RESTATE_ENVIRONMENT_PROXY",
+        "RESTATE_ENVIRONMENT_PROXY_CONNECTIONS",
+        "RESTATE_INGRESS_URI",
+        "RESTATE_REMOTE_PROXY",
+        "RESTATE_SIGNING_PUBLIC_KEY",
+        "RESTATE_TUNNEL_NAME",
+        "RESTATE_TUNNEL_SERVERS",
+        "RESTATE_TUNNEL_SERVERS_SRV",
+        "RESTATE_TUNNEL_SERVER_CONNECTIONS",
+    ];
+
+    struct EnvGuard {
+        saved: Vec<(&'static str, Option<OsString>)>,
+        _lock: MutexGuard<'static, ()>,
+    }
+
+    impl EnvGuard {
+        fn new() -> Self {
+            let lock = ENV_LOCK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let saved = TEST_ENV_KEYS
+                .iter()
+                .map(|key| (*key, env::var_os(key)))
+                .collect();
+
+            for key in TEST_ENV_KEYS {
+                unsafe {
+                    env::remove_var(key);
+                }
+            }
+
+            Self { saved, _lock: lock }
+        }
+
+        fn set(&self, key: &str, value: &str) {
+            unsafe {
+                env::set_var(key, value);
+            }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            for (key, value) in &self.saved {
+                unsafe {
+                    if let Some(value) = value {
+                        env::set_var(key, value);
+                    } else {
+                        env::remove_var(key);
+                    }
+                }
+            }
+        }
+    }
+
+    fn load_options_from_toml_with_extra(extra_toml: &str) -> anyhow::Result<Options> {
+        let path = env::temp_dir().join(format!(
+            "restate-cloud-tunnel-client-options-{}.toml",
+            std::process::id()
+        ));
+
+        std::fs::write(
+            &path,
+            format!(
+                r#"
+environment-id = "env_test"
+signing-public-key = "test-signing-public-key"
+tunnel-name = "test-tunnel"
+tunnel-servers = ["https://127.0.0.1:19080/"]
+auth-token = "test-auth-token"
+ingress-uri = "https://ingress.example.com:8080/"
+admin-uri = "https://admin.example.com:9070/"
+{extra_toml}
+"#,
+            ),
+        )
+        .unwrap();
+
+        let options = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(Options::load(&path));
+
+        let _ = std::fs::remove_file(path);
+
+        options
+    }
+
+    fn load_options_from_toml() -> Options {
+        load_options_from_toml_with_extra("").unwrap()
+    }
+
+    fn extract_shadow_from_env() -> OptionsShadow {
+        Figment::from(Serialized::defaults(OptionsShadow::default()))
+            .merge(
+                Env::prefixed("RESTATE_")
+                    .split("__")
+                    .map(|k| k.as_str().replace('_', "-").into()),
+            )
+            .extract()
+            .unwrap()
+    }
+
+    #[test]
+    fn defaults_connection_tuning_knobs() {
+        let _env_guard = EnvGuard::new();
+        let defaults = load_options_from_toml();
+
+        assert!(defaults.environment_proxy);
+        assert_eq!(defaults.environment_proxy_connections.get(), 6);
+        assert_eq!(defaults.tunnel_server_connections.get(), 1);
+    }
+
+    #[test]
+    fn env_overrides_connection_tuning_knobs() {
+        let env_guard = EnvGuard::new();
+        env_guard.set("RESTATE_ENVIRONMENT_PROXY", "false");
+        env_guard.set("RESTATE_ENVIRONMENT_PROXY_CONNECTIONS", "9");
+        env_guard.set("RESTATE_TUNNEL_SERVER_CONNECTIONS", "3");
+
+        let options = load_options_from_toml();
+
+        assert!(!options.environment_proxy);
+        assert_eq!(options.environment_proxy_connections.get(), 9);
+        assert_eq!(options.tunnel_server_connections.get(), 3);
+    }
+
+    #[test]
+    fn remote_proxy_env_alias_loads_without_collision() {
+        let env_guard = EnvGuard::new();
+        env_guard.set("RESTATE_REMOTE_PROXY", "false");
+
+        let options = load_options_from_toml();
+
+        assert!(!options.environment_proxy);
+    }
+
+    #[test]
+    fn environment_proxy_env_sets_environment_proxy() {
+        let env_guard = EnvGuard::new();
+        env_guard.set("RESTATE_ENVIRONMENT_PROXY", "false");
+
+        let options = load_options_from_toml();
+
+        assert!(!options.environment_proxy);
+    }
+
+    #[test]
+    fn environment_proxy_and_remote_proxy_envs_fail_with_helpful_error() {
+        let env_guard = EnvGuard::new();
+        env_guard.set("RESTATE_ENVIRONMENT_PROXY", "true");
+        env_guard.set("RESTATE_REMOTE_PROXY", "false");
+
+        let error = match load_options_from_toml_with_extra("") {
+            Ok(_) => panic!("expected environment proxy aliases to fail"),
+            Err(error) => error,
+        };
+
+        assert!(
+            error
+                .to_string()
+                .contains("Both RESTATE_ENVIRONMENT_PROXY and RESTATE_REMOTE_PROXY are set")
+        );
+    }
+
+    #[test]
+    fn environment_proxy_and_remote_proxy_sources_fail_with_helpful_error() {
+        let env_guard = EnvGuard::new();
+        env_guard.set("RESTATE_ENVIRONMENT_PROXY", "true");
+
+        let error = match load_options_from_toml_with_extra("remote-proxy = false") {
+            Ok(_) => panic!("expected environment proxy aliases to fail"),
+            Err(error) => error,
+        };
+
+        assert!(
+            error
+                .to_string()
+                .contains("Both 'environment-proxy' and 'remote-proxy' are set")
+        );
+    }
+
+    #[test]
+    fn shadow_defaults_do_not_serialize_environment_proxy() {
+        let _env_guard = EnvGuard::new();
+        let shadow = extract_shadow_from_env();
+
+        assert_eq!(shadow.environment_proxy, None);
     }
 }

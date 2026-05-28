@@ -136,15 +136,15 @@ pub async fn main() -> anyhow::Result<()> {
         authorization
     };
 
-    if options.remote_proxy {
+    if options.environment_proxy {
         {
             let router = axum::Router::new()
                 .fallback(remote_proxy)
                 .with_state(Arc::new(ProxyState {
                     base_uri: options.ingress_uri.clone(),
-                    // for calls to restate cloud, we use 6 conns so we have a fair spread over the 3 nlb ips
+                    server: authority_label(&options.ingress_uri),
                     client: round_robin_client(
-                        NonZeroUsize::new(6).unwrap(),
+                        options.environment_proxy_connections,
                         http2_builder,
                         &https_alpn_connector,
                     ),
@@ -171,9 +171,9 @@ pub async fn main() -> anyhow::Result<()> {
                 .fallback(remote_proxy)
                 .with_state(Arc::new(ProxyState {
                     base_uri: options.admin_uri.clone(),
-                    // for calls to restate cloud, we use 6 conns so we have a fair spread over the 3 nlb ips
+                    server: authority_label(&options.admin_uri),
                     client: round_robin_client(
-                        NonZeroUsize::new(6).unwrap(),
+                        options.environment_proxy_connections,
                         http2_builder,
                         &https_alpn_connector,
                     ),
@@ -195,7 +195,7 @@ pub async fn main() -> anyhow::Result<()> {
             tokio::spawn(connections.track_future(server.into_future()));
         };
     } else {
-        info!("Not proxying local ports to Restate Cloud as RESTATE_REMOTE_PROXY is false");
+        info!("Not proxying local ports to Restate Cloud as RESTATE_ENVIRONMENT_PROXY is false");
     }
 
     {
@@ -253,19 +253,27 @@ pub async fn main() -> anyhow::Result<()> {
                 continue;
             }
 
-            info!(%server, %server_name, "Starting new tunnel");
+            info!(
+                %server,
+                %server_name,
+                connections = options.tunnel_server_connections.get(),
+                "Starting new tunnel"
+            );
 
-            let (status_send, status_recv) = watch::channel(TunnelStatus::Opening);
-            let token = token.child_token();
+            let server_token = token.child_token();
+            let mut statuses = Vec::with_capacity(options.tunnel_server_connections.get());
 
-            let alpn_client = round_robin_client(
+            let alpn_client = Arc::new(round_robin_client(
                 options.pools_per_tunnel,
                 &http1_or_http2_builder,
                 &https_alpn_connector,
-            );
+            ));
             let http1_client = http1_client.clone();
-            let http2_client =
-                round_robin_client(options.pools_per_tunnel, http2_builder, &https_h2_connector);
+            let http2_client = Arc::new(round_robin_client(
+                options.pools_per_tunnel,
+                http2_builder,
+                &https_h2_connector,
+            ));
 
             let https_connector = hyper_rustls::HttpsConnectorBuilder::new()
                 .with_tls_config(TLS_CLIENT_CONFIG.clone())
@@ -276,36 +284,64 @@ pub async fn main() -> anyhow::Result<()> {
                 .enable_http2()
                 .wrap_connector(http_connector.clone());
 
-            let handler = Handler::<(), ()>::new(
-                hyper::service::service_fn(move |req| {
-                    local_proxy(&alpn_client, &http1_client, &http2_client, req)
-                }),
-                &options.environment_id,
-                &options.signing_public_key,
-                &options.auth_token,
-                Some(options.tunnel_name.clone()),
-                Option::<fn(_)>::None,
-            )
-            .expect("failed to create tunnel handler");
+            for connection_index in 0..options.tunnel_server_connections.get() {
+                let (status_send, status_recv) = watch::channel(TunnelStatus::Opening);
+                let connection_token = server_token.child_token();
+                let alpn_client = alpn_client.clone();
+                let http1_client = http1_client.clone();
+                let http2_client = http2_client.clone();
 
-            let tunnel_metrics =
-                METRICS.tunnel(server.authority().map(|a| a.as_str()).unwrap_or_default());
+                let tunnel_metrics = METRICS.tunnel(
+                    server.authority().map(|a| a.as_str()).unwrap_or_default(),
+                    connection_index,
+                );
+                let request_metrics = tunnel_metrics.clone();
 
-            let fut = handle_tunnel_uri(
-                handler,
-                https_connector,
-                token.clone(),
-                status_send,
+                let handler = Handler::<(), ()>::new(
+                    hyper::service::service_fn(move |req| {
+                        local_proxy(
+                            &alpn_client,
+                            &http1_client,
+                            &http2_client,
+                            request_metrics.clone(),
+                            req,
+                        )
+                    }),
+                    &options.environment_id,
+                    &options.signing_public_key,
+                    &options.auth_token,
+                    Some(options.tunnel_name.clone()),
+                    Option::<fn(_)>::None,
+                )
+                .expect("failed to create tunnel handler");
+
+                let fut = handle_tunnel_uri(
+                    handler,
+                    https_connector.clone(),
+                    connection_token,
+                    status_send,
+                    server.clone(),
+                    tunnel_metrics,
+                )
+                .instrument(
+                    info_span!("tunnel", %server, %server_name, connection = connection_index)
+                        .or_current(),
+                );
+
+                tokio::spawn(connections.track_future(fut));
+                statuses.push(status_recv);
+            }
+
+            uris.insert(
                 server.clone(),
-                tunnel_metrics,
-            )
-            .instrument(info_span!("tunnel", %server, %server_name).or_current());
-
-            tokio::spawn(connections.track_future(fut));
-            uris.insert(server.clone(), (token, status_recv));
+                ServerConnections {
+                    token: server_token,
+                    statuses,
+                },
+            );
         }
 
-        uris.retain(|existing_uri, (token, _)| {
+        uris.retain(|existing_uri, connections| {
             if !tunnel_servers.contains_key(existing_uri) {
                 info!(server = %existing_uri, "Tearing down tunnel");
                 METRICS.remove_tunnel(
@@ -313,8 +349,9 @@ pub async fn main() -> anyhow::Result<()> {
                         .authority()
                         .map(|a| a.as_str())
                         .unwrap_or_default(),
+                    connections.statuses.len(),
                 );
-                token.cancel();
+                connections.token.cancel();
                 false
             } else {
                 true
@@ -338,9 +375,13 @@ pub async fn main() -> anyhow::Result<()> {
 
 #[derive(Clone)]
 struct HealthState {
-    #[allow(clippy::type_complexity)]
-    uris: Arc<RwLock<HashMap<Uri, (CancellationToken, watch::Receiver<TunnelStatus>)>>>,
+    uris: Arc<RwLock<HashMap<Uri, ServerConnections>>>,
     started: Arc<AtomicBool>,
+}
+
+struct ServerConnections {
+    token: CancellationToken,
+    statuses: Vec<watch::Receiver<TunnelStatus>>,
 }
 
 #[serde_with::serde_as]
@@ -356,8 +397,8 @@ async fn health(
         Ok(uris) => {
             let mut statuses = HashMap::new();
             let mut one_open = false;
-            for (uri, (_, receiver)) in uris.iter() {
-                let status = *receiver.borrow();
+            for (uri, connections) in uris.iter() {
+                let status = aggregate_tunnel_status(&connections.statuses);
                 statuses.insert(uri.clone(), status);
                 if matches!(status, TunnelStatus::Open) {
                     one_open = true
@@ -369,7 +410,7 @@ async fn health(
                 true
             } else {
                 // once we have started, we don't want to stop being ready because the tunnel servers are down
-                // otherwise our endpoints will stop getting published and we could break remote proxy outbound calls
+                // otherwise our endpoints will stop getting published and we could break environment proxy outbound calls
                 state.started.load(Ordering::Relaxed)
             };
 
@@ -389,6 +430,32 @@ async fn health(
     }
 }
 
+fn aggregate_tunnel_status(statuses: &[watch::Receiver<TunnelStatus>]) -> TunnelStatus {
+    let mut saw_opening = false;
+    let mut saw_draining = false;
+    let mut saw_backing_off = false;
+
+    for receiver in statuses {
+        match *receiver.borrow() {
+            TunnelStatus::Open => return TunnelStatus::Open,
+            TunnelStatus::Opening => saw_opening = true,
+            TunnelStatus::Draining => saw_draining = true,
+            TunnelStatus::BackingOff => saw_backing_off = true,
+            TunnelStatus::Cancelled => {}
+        }
+    }
+
+    if saw_opening {
+        TunnelStatus::Opening
+    } else if saw_draining {
+        TunnelStatus::Draining
+    } else if saw_backing_off {
+        TunnelStatus::BackingOff
+    } else {
+        TunnelStatus::Cancelled
+    }
+}
+
 async fn metrics_endpoint() -> impl IntoResponse {
     (
         [(http::header::CONTENT_TYPE, "text/plain; version=0.0.4")],
@@ -398,6 +465,7 @@ async fn metrics_endpoint() -> impl IntoResponse {
 
 struct ProxyState {
     base_uri: Uri,
+    server: String,
     client: RoundRobinClient<axum::body::Body>,
     authorization: http::HeaderValue,
 }
@@ -431,10 +499,16 @@ async fn remote_proxy(
     let span = debug_span!("remote_request", destination = %req.uri());
 
     async {
-        let result = match state.client.get().request(req).await {
+        let (client, connection_index) = state.client.get();
+        let connection_index = connection_index.to_string();
+        let request_metrics = METRICS.request(&state.server, &connection_index, "outbound");
+        let request_guard = request_metrics.start();
+
+        let result = match client.request(req).await {
             Ok(result) => result,
             Err(err) => {
                 debug!(%err, "Failed to proxy request to Restate Cloud");
+                request_guard.finish(false);
                 METRICS.record_remote_proxy_request(false);
 
                 return http::Response::builder()
@@ -444,6 +518,7 @@ async fn remote_proxy(
             }
         };
 
+        request_guard.finish(true);
         METRICS.record_remote_proxy_request(true);
         debug!(
             status = result.status().as_u16(),
@@ -492,6 +567,7 @@ fn remote_proxy_headers(headers: &mut http::HeaderMap, authorization: http::Head
 enum TunnelStatus {
     Opening,
     Open,
+    Draining,
     BackingOff,
     Cancelled,
 }
@@ -565,11 +641,12 @@ async fn handle_tunnel_uri<Notify, Client, ClientError, ClientFuture, ResponseBo
             }
         });
         // we treat the tunnel as opened 5s after the connection is open, as the handshake timeout is 5s
-        let mut opened_after = std::pin::pin!(
-            connected_rx
-                .and_then(|_| async { Ok(tokio::time::sleep(Duration::from_secs(5)).await) })
-        );
+        let mut opened_after = std::pin::pin!(connected_rx.and_then(|_| async {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            Ok(())
+        }));
         let mut opened = false;
+        let mut draining = false;
 
         loop {
             tokio::select! {
@@ -595,6 +672,8 @@ async fn handle_tunnel_uri<Notify, Client, ClientError, ClientFuture, ResponseBo
                     break
                 }
                 _ = on_drain.cancelled() => {
+                    let _ = status.send(TunnelStatus::Draining);
+                    draining = true;
                     metrics.draining(true);
                     let metrics = metrics.clone();
                     tokio::task::spawn(async move {
@@ -631,7 +710,11 @@ async fn handle_tunnel_uri<Notify, Client, ClientError, ClientFuture, ResponseBo
         }
 
         metrics.opened(false);
-        let _ = status.send(TunnelStatus::BackingOff);
+        let _ = status.send(if draining {
+            TunnelStatus::Draining
+        } else {
+            TunnelStatus::BackingOff
+        });
 
         tokio::select! {
             _ = token.cancelled() => {
@@ -681,9 +764,15 @@ impl<B> RoundRobinClient<B> {
         }
     }
 
-    fn get(&self) -> &hyper_util::client::legacy::Client<HttpsConnector<HttpConnector>, B> {
+    fn get(
+        &self,
+    ) -> (
+        &hyper_util::client::legacy::Client<HttpsConnector<HttpConnector>, B>,
+        usize,
+    ) {
         let i = self.index.fetch_add(1, Ordering::Relaxed);
-        &self.clients[i % self.clients.len()]
+        let connection_index = i % self.clients.len();
+        (&self.clients[connection_index], connection_index)
     }
 }
 
@@ -691,6 +780,7 @@ fn local_proxy(
     alpn_client: &RoundRobinClient<Incoming>,
     http1_client: &hyper_util::client::legacy::Client<HttpsConnector<HttpConnector>, Incoming>,
     http2_client: &RoundRobinClient<Incoming>,
+    metrics: TunnelMetrics,
     req: http::Request<Incoming>,
 ) -> impl Future<
     Output = Result<
@@ -706,10 +796,12 @@ fn local_proxy(
 >
 + 'static
 + use<> {
+    let request_guard = metrics.start_request();
     let (mut head, body) = req.into_parts();
 
     let Some(path_and_query) = head.uri.path_and_query() else {
         warn!(uri = %head.uri, "Tunnel request was missing path");
+        request_guard.finish(false);
         return std::future::ready(Ok(http::Response::builder()
             .status(StatusCode::BAD_REQUEST)
             .body(http_body_util::Either::Left(http_body_util::Empty::new()))
@@ -721,6 +813,7 @@ fn local_proxy(
         Ok(destination) => destination,
         Err(message) => {
             warn!(uri = %head.uri, "Tunnel request had an invalid path ({})", message);
+            request_guard.finish(false);
             return std::future::ready(Ok(http::Response::builder()
                 .status(StatusCode::BAD_REQUEST)
                 .body(http_body_util::Either::Left(http_body_util::Empty::new()))
@@ -730,6 +823,7 @@ fn local_proxy(
     };
 
     head.uri = destination;
+    let instance = authority_label(&head.uri);
 
     let client = match (
         head.uri.scheme_str(),
@@ -742,18 +836,18 @@ fn local_proxy(
             // we don't want to force HTTP2 as we don't know if the destination accepts it
             // a request with HTTP_11 can still end up using h2 if the alpn agrees
             head.version = http::Version::HTTP_11;
-            alpn_client.get()
+            alpn_client.get().0
         }
         // cleartext requests where the user didn't request a specific version; use http2 prior-knowledge
         (_, None) => {
             head.version = http::Version::HTTP_2;
-            http2_client.get()
+            http2_client.get().0
         }
         // https or cleartext requests where the user requested http2; use http2
         // prior-knowledge for cleartext, h2 in alpn otherwise
         (_, Some(b"HTTP/2.0")) => {
             head.version = http::Version::HTTP_2;
-            http2_client.get()
+            http2_client.get().0
         }
         // https or cleartext requests where the user requested http1.1; use http1.1
         // will not use h2 even if the alpn supports it
@@ -763,6 +857,7 @@ fn local_proxy(
         }
         (_, Some(other)) => {
             warn!(uri = %head.uri, "Tunnel request had an invalid x-restate-tunnel-http-version ({})", String::from_utf8_lossy(other));
+            request_guard.finish(false);
             return std::future::ready(Ok(http::Response::builder()
                 .status(StatusCode::BAD_REQUEST)
                 .body(http_body_util::Either::Left(http_body_util::Empty::new()))
@@ -775,11 +870,15 @@ fn local_proxy(
 
     let span = debug_span!("local_request", destination = %req.uri());
 
+    let local_handler_metrics = METRICS.local_handler(&instance);
     let fut = client.request(req);
 
     async move {
+        let local_handler_guard = local_handler_metrics.start();
         match fut.await {
             Ok(response) => {
+                local_handler_guard.finish();
+                request_guard.finish(true);
                 METRICS.record_local_proxy_request(true);
                 debug!(
                     status = response.status().as_u16(),
@@ -788,6 +887,8 @@ fn local_proxy(
                 Ok(response.map(http_body_util::Either::Right))
             }
             Err(err) => {
+                local_handler_guard.finish();
+                request_guard.finish(false);
                 METRICS.record_local_proxy_request(false);
                 error!(%err, "Failed to proxy request from Restate Cloud");
 
@@ -800,6 +901,12 @@ fn local_proxy(
     }
     .instrument(span)
     .right_future()
+}
+
+fn authority_label(uri: &Uri) -> String {
+    uri.authority()
+        .map(|authority| authority.as_str().to_owned())
+        .unwrap_or_default()
 }
 
 fn parse_tunnel_destination(path_and_query: &http::uri::PathAndQuery) -> Result<Uri, &'static str> {

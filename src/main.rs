@@ -30,11 +30,13 @@ use tracing::{Instrument, debug, debug_span, error, info, info_span, warn};
 use tracing_subscriber::filter::LevelFilter;
 
 use crate::{
+    gcp_auth::GcpIdTokenSource,
     metrics::{METRICS, TunnelMetrics},
     options::Options,
     signal::shutdown,
 };
 
+mod gcp_auth;
 mod metrics;
 mod options;
 mod signal;
@@ -117,6 +119,11 @@ pub async fn main() -> anyhow::Result<()> {
         .https_or_http()
         .enable_http2()
         .wrap_connector(http_connector.clone());
+
+    let gcp_auth = options.gcp_auth.then(|| {
+        info!("Attaching Google ID tokens to requests proxied to local https services");
+        Arc::new(GcpIdTokenSource::new(http_connector.clone()))
+    });
 
     let uris = Arc::new(RwLock::new(HashMap::new()));
     let connections = TaskTracker::new();
@@ -266,6 +273,7 @@ pub async fn main() -> anyhow::Result<()> {
             let http1_client = http1_client.clone();
             let http2_client =
                 round_robin_client(options.pools_per_tunnel, http2_builder, &https_h2_connector);
+            let gcp_auth = gcp_auth.clone();
 
             let https_connector = hyper_rustls::HttpsConnectorBuilder::new()
                 .with_tls_config(TLS_CLIENT_CONFIG.clone())
@@ -278,7 +286,13 @@ pub async fn main() -> anyhow::Result<()> {
 
             let handler = Handler::<(), ()>::new(
                 hyper::service::service_fn(move |req| {
-                    local_proxy(&alpn_client, &http1_client, &http2_client, req)
+                    local_proxy(
+                        &alpn_client,
+                        &http1_client,
+                        &http2_client,
+                        gcp_auth.as_ref(),
+                        req,
+                    )
                 }),
                 &options.environment_id,
                 &options.signing_public_key,
@@ -691,6 +705,7 @@ fn local_proxy(
     alpn_client: &RoundRobinClient<Incoming>,
     http1_client: &hyper_util::client::legacy::Client<HttpsConnector<HttpConnector>, Incoming>,
     http2_client: &RoundRobinClient<Incoming>,
+    gcp_auth: Option<&Arc<GcpIdTokenSource>>,
     req: http::Request<Incoming>,
 ) -> impl Future<
     Output = Result<
@@ -771,14 +786,39 @@ fn local_proxy(
         }
     };
 
-    let req = http::Request::from_parts(head, body);
+    // tokens are only attached to https destinations
+    let gcp_auth = gcp_auth.and_then(|source| {
+        let audience = GcpIdTokenSource::audience(&head.uri)?;
+        Some((source.clone(), audience))
+    });
+
+    let mut req = http::Request::from_parts(head, body);
 
     let span = debug_span!("local_request", destination = %req.uri());
 
-    let fut = client.request(req);
+    let client = client.clone();
 
     async move {
-        match fut.await {
+        if let Some((source, audience)) = gcp_auth {
+            match source.authorization(&audience).await {
+                Ok(authorization) => {
+                    req.headers_mut()
+                        .insert(http::header::AUTHORIZATION, authorization);
+                }
+                Err(err) => {
+                    METRICS.record_gcp_auth_failure();
+                    METRICS.record_local_proxy_request(false);
+                    error!(%err, "Failed to obtain Google ID token for request from Restate Cloud");
+
+                    return Ok(http::Response::builder()
+                        .status(StatusCode::BAD_GATEWAY)
+                        .body(http_body_util::Either::Left(http_body_util::Empty::new()))
+                        .unwrap());
+                }
+            }
+        }
+
+        match client.request(req).await {
             Ok(response) => {
                 METRICS.record_local_proxy_request(true);
                 debug!(

@@ -27,6 +27,6 @@ RUN just arch=$TARGETARCH libc=musl chef-cook --release --bin restate-cloud-tunn
 COPY .. .
 RUN just arch=$TARGETARCH libc=musl build --release --bin restate-cloud-tunnel-client && mv target/$(just arch=$TARGETARCH libc=musl print-target)/release/restate-cloud-tunnel-client target/restate-cloud-tunnel-client
 
-FROM gcr.io/distroless/static:nonroot
+FROM gcr.io/distroless/static:nonroot AS runtime
 COPY --from=builder --chown=nonroot:nonroot /restate/target/restate-cloud-tunnel-client /app/restate-cloud-tunnel-client
 ENTRYPOINT ["/app/restate-cloud-tunnel-client"]

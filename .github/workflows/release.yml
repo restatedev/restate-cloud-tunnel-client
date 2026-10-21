@@ -6,8 +6,27 @@ on:
       - v**
 
 jobs:
+  # Main requires a reviewed pull request, so releasing only commits on main
+  # means every published image was built from reviewed code.
+  verify-release-commit:
+    name: Verify tagged commit is on main
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Check tagged commit is reachable from main
+        run: |
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
+            echo "::error::Tag $GITHUB_REF_NAME points at $GITHUB_SHA, which is not on main. Merge the release commit to main before tagging."
+            exit 1
+          fi
+
   build-docker-image:
     name: Build release Docker image
+    needs: [verify-release-commit]
     uses: ./.github/workflows/docker.yml
     secrets: inherit
 

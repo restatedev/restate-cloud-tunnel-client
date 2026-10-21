@@ -9,3 +9,5 @@ jobs:
     name: Build docker image
     uses: restatedev/restate/.github/workflows/docker.yml@main
     secrets: inherit
+    with:
+      cargoPackage: restate-cloud-tunnel-client

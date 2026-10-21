@@ -22,7 +22,7 @@ for low-traffic deployments).
 |---|---|---|---|
 | `environment-proxy-connections` / `RESTATE_ENVIRONMENT_PROXY_CONNECTIONS` | NonZeroUsize | 6 | Outbound H2 connections to the cloud; applied to both the ingress (:8080) and admin (:9070) proxies |
 | `tunnel-server-connections` / `RESTATE_TUNNEL_SERVER_CONNECTIONS` | NonZeroUsize | 1 | Inbound tunnel connections opened to each resolved tunnel server |
-| `environment-proxy` / `RESTATE_ENVIRONMENT_PROXY` | bool | true | Renamed from `remote-proxy`; serde `alias = "remote-proxy"` keeps the old name working |
+| `environment-proxy` / `RESTATE_ENVIRONMENT_PROXY` | bool | true | Renamed from `remote-proxy`; the old name is still read from the config file and `RESTATE_REMOTE_PROXY` |
 
 `pools-per-tunnel` (existing, default 16) is unchanged.
 
@@ -35,21 +35,17 @@ only if a real asymmetry shows up.
 
 ### `options.rs`
 - Rename the toggle `remote_proxy` -> `environment_proxy`. In `OptionsShadow` it
-  MUST be `Option<bool>` with
-  `#[serde(alias = "remote-proxy", skip_serializing_if = "Option::is_none")]`,
-  mirroring the existing `auth_token` / `bearer-token` field. Resolve the `true`
-  default after `extract()` when building `Options` (`Options.environment_proxy:
-  bool`).
+  MUST be `Option<bool>` with `#[serde(skip_serializing_if = "Option::is_none")]`.
+  Resolve the `true` default after `extract()` when building `Options`
+  (`Options.environment_proxy: bool`).
 
   Why not a plain `bool`: a non-`Option` default is serialized by
-  `Serialized::defaults` under the renamed key `environment-proxy`, while the
-  operator's `RESTATE_REMOTE_PROXY` arrives as the aliased key `remote-proxy`.
-  Both then exist in the merged figment dict and serde rejects them as a duplicate
-  field, so `Options::load` fails closed on every operator-managed pod. Verified
-  against figment 0.10.19 / serde in this repo: plain-`bool` errors with
-  `duplicate field environment-proxy`; `Option<bool>` + `skip_serializing_if`
-  extracts cleanly. (The existing `RESTATE_REMOTE_PROXY` works today only because
-  the default key and the env key are the same string; the rename splits them.)
+  `Serialized::defaults` under `environment-proxy`, so a layer that supplies
+  `remote-proxy` would put both keys in the merged figment dict.
+- The deprecated `remote-proxy` name is renamed to `environment-proxy` within each
+  layer (config file, environment) before the layers are merged, instead of using
+  a serde alias. Normal precedence (environment over file) therefore holds
+  whichever name each layer uses.
 - Add `environment_proxy_connections: NonZeroUsize` and
   `tunnel_server_connections: NonZeroUsize` to both structs. These can stay
   non-`Option` (like `pools_per_tunnel`): they have no aliased env key, so the
@@ -57,10 +53,11 @@ only if a real asymmetry shows up.
 - `OptionsShadow::default()`: `environment_proxy: None`,
   `environment_proxy_connections: 6`, `tunnel_server_connections: 1`.
 - Reject configurations that set both `environment-proxy` and `remote-proxy`
-  before serde extraction, with a friendly error matching the existing
-  `auth-token` / `bearer-token` migration guard. This includes the env/env case
-  (`RESTATE_ENVIRONMENT_PROXY` + `RESTATE_REMOTE_PROXY`) and mixed file/env
-  cases.
+  within the same layer, with a friendly error matching the existing
+  `auth-token` / `bearer-token` migration guard: both in the config file, or both
+  `RESTATE_ENVIRONMENT_PROXY` and `RESTATE_REMOTE_PROXY` in the environment.
+  Across layers there is no conflict: the operator emits `RESTATE_REMOTE_PROXY`
+  and the environment simply overrides a config file that uses either name.
 
 ### `main.rs` outbound (trivial)
 - Replace both `NonZeroUsize::new(6).unwrap()` literals (the ingress and admin
@@ -117,12 +114,23 @@ Open `tunnel_server_connections` connections per resolved server instead of one.
   old per-server view.
 - Add request-level metrics for performance diagnosis:
   - `requests_total{server,connection,direction,status}` with
-    `direction = inbound|outbound` and `status = ok|error`;
+    `direction = inbound|outbound` and `status = ok|error`. `connection` is the
+    tunnel connection index for inbound series. Outbound series set
+    `connection=""` (an empty label value is absent in Prometheus) because the
+    outbound round-robin pool index is not a tunnel connection;
   - `request_duration_seconds{server,connection,direction}` with buckets
     `[0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30]`;
   - `requests_inflight{server,connection,direction}`;
-  - `local_handler_duration_seconds{instance}` with the same buckets;
-  - `local_handler_inflight{instance}`.
+  - `local_handler_duration_seconds` with the same buckets;
+  - `local_handler_inflight`.
+
+  The local-handler metrics carry no labels: a per-destination label would grow
+  without bound and nothing would remove those series.
+  `remove_tunnel` removes every inbound series of the server and connection:
+  `opened`, `draining`, `connection_attempts`, `requests_inflight`,
+  `request_duration_seconds` and `requests_total` for every status.
+  Each request outcome is recorded in one place, which also increments the legacy
+  `local_proxy_requests_total` / `remote_proxy_requests_total` counters.
 
   Request duration is measured until upstream response headers are received. The
   local-handler metrics are measured from forwarding to the local handler until
@@ -133,6 +141,8 @@ Open `tunnel_server_connections` connections per resolved server instead of one.
 - Aggregate the N connection statuses per server with a deterministic precedence,
   reporting the highest present: `Open > Opening > Draining > BackingOff >
   Cancelled`. `HealthOutput` stays keyed by `Uri`.
+- A connection reports `Draining` only while a drained connection is still running;
+  once it has exited, the backoff sleep before reconnecting reports `BackingOff`.
 - `started` readiness latch is unchanged: any connection open anywhere -> started.
 
 ## Inbound throughput: cloud-side behavior
@@ -178,16 +188,19 @@ and never both names in the same pod.
 - The operator-side "sidecar tunnel" option (lives in restate-operator).
 
 ## Testing
-- `options.rs` tests (these must run serially or with isolated env, since they set
-  process env vars):
+- `options.rs` tests run inside `figment::Jail`, which serializes them and isolates
+  the environment and working directory:
   - defaults resolve as expected (`environment_proxy = true`, connections 6 / 1);
   - env override of each new knob;
   - **regression for the collision**: with `RESTATE_REMOTE_PROXY=false` set,
     `Options::load` succeeds and yields `environment_proxy = false` (this is the
     case that fails with a plain `bool`);
   - `RESTATE_ENVIRONMENT_PROXY=false` also works;
-  - setting both `environment-proxy` and `remote-proxy` fails with a friendly
-    error before serde reports a duplicate field.
+  - file `environment-proxy` + env `RESTATE_REMOTE_PROXY`, and file
+    `remote-proxy` + env `RESTATE_ENVIRONMENT_PROXY`: the environment wins, no
+    error;
+  - both names in the config file, or both variables in the environment, fail with
+    a friendly error before serde reports a duplicate field.
 - Existing `parse_tunnel_destination` tests are unaffected.
 - Manual: with `tunnel_server_connections=N`, confirm N connections per server and
   N `opened` series per server; with `environment_proxy_connections=M`, confirm M

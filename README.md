@@ -28,7 +28,7 @@ In addition to exposing local services to Restate Cloud, by default the tunnel c
 and admin endpoints from Restate Cloud on its local 8080 and 9070 ports. This behaviour can be disabled with `RESTATE_ENVIRONMENT_PROXY=false` (`RESTATE_REMOTE_PROXY=false` is still accepted as a deprecated alias). If left enabled, be careful to restrict access to these ports;
 access to them is equivalent to having the configured `RESTATE_AUTH_TOKEN`.
 
-Do not set both `RESTATE_ENVIRONMENT_PROXY` and `RESTATE_REMOTE_PROXY`. For rollback compatibility, keep using `RESTATE_REMOTE_PROXY` until every tunnel client binary in the rollout supports `RESTATE_ENVIRONMENT_PROXY`; older binaries ignore the new name and fall back to the default of `true`.
+Do not set both `RESTATE_ENVIRONMENT_PROXY` and `RESTATE_REMOTE_PROXY`, and do not set both `environment-proxy` and `remote-proxy` in the config file. Across sources the usual precedence applies whichever name each uses: environment variables override the config file. For rollback compatibility, keep using `RESTATE_REMOTE_PROXY` until every tunnel client binary in the rollout supports `RESTATE_ENVIRONMENT_PROXY`; older binaries ignore the new name and fall back to the default of `true`.
 
 When the tunnel client is managed by the current Restate operator, use `RESTATE_REMOTE_PROXY` for this toggle. The operator emits that env var itself, so adding `RESTATE_ENVIRONMENT_PROXY` separately will make the tunnel client reject the duplicate configuration. Switching the operator to the new name requires a coordinated operator change that never emits both names and only rolls out after the tunnel client image supports `RESTATE_ENVIRONMENT_PROXY`.
 
@@ -40,10 +40,10 @@ When the tunnel client is managed by the current Restate operator, use `RESTATE_
 ## Metrics
 The health endpoint also serves Prometheus metrics at `/metrics`. Request-level metrics include:
 
-- `restate_cloud_tunnel_requests_total{server,connection,direction,status}` for proxied request throughput.
+- `restate_cloud_tunnel_requests_total{server,connection,direction,status}` for proxied request throughput. `connection` is the tunnel connection index for `direction="inbound"` and empty (so absent in Prometheus) for `direction="outbound"`, where requests are spread over a round-robin pool rather than a numbered connection.
 - `restate_cloud_tunnel_request_duration_seconds{server,connection,direction}` for time from tunnel-client request handling until upstream response headers.
-- `restate_cloud_tunnel_requests_inflight{server,connection,direction}` for request concurrency per tunnel or environment-proxy connection.
-- `restate_cloud_tunnel_local_handler_duration_seconds{instance}` and `restate_cloud_tunnel_local_handler_inflight{instance}` for local service handler latency and concurrency.
+- `restate_cloud_tunnel_requests_inflight{server,connection,direction}` for request concurrency per tunnel connection (inbound) or per environment-proxy endpoint (outbound).
+- `restate_cloud_tunnel_local_handler_duration_seconds` and `restate_cloud_tunnel_local_handler_inflight` for local service handler latency and concurrency, across all local destinations.
 
 Use `sum without (connection)` to aggregate per-connection tunnel metrics back to the previous per-server view.
 

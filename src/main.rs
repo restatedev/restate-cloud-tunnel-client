@@ -30,7 +30,7 @@ use tracing::{Instrument, debug, debug_span, error, info, info_span, warn};
 use tracing_subscriber::filter::LevelFilter;
 
 use crate::{
-    metrics::{METRICS, TunnelMetrics},
+    metrics::{METRICS, RequestMetrics, TunnelMetrics},
     options::Options,
     signal::shutdown,
 };
@@ -142,7 +142,8 @@ pub async fn main() -> anyhow::Result<()> {
                 .fallback(remote_proxy)
                 .with_state(Arc::new(ProxyState {
                     base_uri: options.ingress_uri.clone(),
-                    server: authority_label(&options.ingress_uri),
+                    request_metrics: METRICS
+                        .outbound_request(&authority_label(&options.ingress_uri)),
                     client: round_robin_client(
                         options.environment_proxy_connections,
                         http2_builder,
@@ -171,7 +172,7 @@ pub async fn main() -> anyhow::Result<()> {
                 .fallback(remote_proxy)
                 .with_state(Arc::new(ProxyState {
                     base_uri: options.admin_uri.clone(),
-                    server: authority_label(&options.admin_uri),
+                    request_metrics: METRICS.outbound_request(&authority_label(&options.admin_uri)),
                     client: round_robin_client(
                         options.environment_proxy_connections,
                         http2_builder,
@@ -295,7 +296,7 @@ pub async fn main() -> anyhow::Result<()> {
                     server.authority().map(|a| a.as_str()).unwrap_or_default(),
                     connection_index,
                 );
-                let request_metrics = tunnel_metrics.clone();
+                let request_metrics = tunnel_metrics.request_metrics();
 
                 let handler = Handler::<(), ()>::new(
                     hyper::service::service_fn(move |req| {
@@ -303,7 +304,7 @@ pub async fn main() -> anyhow::Result<()> {
                             &alpn_client,
                             &http1_client,
                             &http2_client,
-                            request_metrics.clone(),
+                            &request_metrics,
                             req,
                         )
                     }),
@@ -465,7 +466,7 @@ async fn metrics_endpoint() -> impl IntoResponse {
 
 struct ProxyState {
     base_uri: Uri,
-    server: String,
+    request_metrics: RequestMetrics,
     client: RoundRobinClient<axum::body::Body>,
     authorization: http::HeaderValue,
 }
@@ -499,17 +500,14 @@ async fn remote_proxy(
     let span = debug_span!("remote_request", destination = %req.uri());
 
     async {
-        let (client, connection_index) = state.client.get();
-        let connection_index = connection_index.to_string();
-        let request_metrics = METRICS.request(&state.server, &connection_index, "outbound");
-        let request_guard = request_metrics.start();
+        let request_guard = state.request_metrics.start();
+        let (client, _) = state.client.get();
 
         let result = match client.request(req).await {
             Ok(result) => result,
             Err(err) => {
                 debug!(%err, "Failed to proxy request to Restate Cloud");
                 request_guard.finish(false);
-                METRICS.record_remote_proxy_request(false);
 
                 return http::Response::builder()
                     .status(http::StatusCode::BAD_GATEWAY)
@@ -519,7 +517,6 @@ async fn remote_proxy(
         };
 
         request_guard.finish(true);
-        METRICS.record_remote_proxy_request(true);
         debug!(
             status = result.status().as_u16(),
             "Proxied request to Restate Cloud",
@@ -780,7 +777,7 @@ fn local_proxy(
     alpn_client: &RoundRobinClient<Incoming>,
     http1_client: &hyper_util::client::legacy::Client<HttpsConnector<HttpConnector>, Incoming>,
     http2_client: &RoundRobinClient<Incoming>,
-    metrics: TunnelMetrics,
+    request_metrics: &RequestMetrics,
     req: http::Request<Incoming>,
 ) -> impl Future<
     Output = Result<
@@ -796,7 +793,7 @@ fn local_proxy(
 >
 + 'static
 + use<> {
-    let request_guard = metrics.start_request();
+    let request_guard = request_metrics.start();
     let (mut head, body) = req.into_parts();
 
     let Some(path_and_query) = head.uri.path_and_query() else {
@@ -823,7 +820,6 @@ fn local_proxy(
     };
 
     head.uri = destination;
-    let instance = authority_label(&head.uri);
 
     let client = match (
         head.uri.scheme_str(),
@@ -870,16 +866,15 @@ fn local_proxy(
 
     let span = debug_span!("local_request", destination = %req.uri());
 
-    let local_handler_metrics = METRICS.local_handler(&instance);
+    let local_handler_metrics = METRICS.local_handler();
     let fut = client.request(req);
 
     async move {
         let local_handler_guard = local_handler_metrics.start();
         match fut.await {
             Ok(response) => {
-                local_handler_guard.finish();
+                local_handler_guard.finish(true);
                 request_guard.finish(true);
-                METRICS.record_local_proxy_request(true);
                 debug!(
                     status = response.status().as_u16(),
                     "Proxied request from Restate Cloud"
@@ -887,9 +882,8 @@ fn local_proxy(
                 Ok(response.map(http_body_util::Either::Right))
             }
             Err(err) => {
-                local_handler_guard.finish();
+                local_handler_guard.finish(false);
                 request_guard.finish(false);
-                METRICS.record_local_proxy_request(false);
                 error!(%err, "Failed to proxy request from Restate Cloud");
 
                 Ok(http::Response::builder()

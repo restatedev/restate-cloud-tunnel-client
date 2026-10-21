@@ -1,16 +1,19 @@
 use prometheus::{
-    Encoder, Histogram, HistogramOpts, HistogramVec, IntCounterVec, IntGaugeVec, Opts, Registry,
-    TextEncoder,
+    Encoder, Histogram, HistogramOpts, HistogramVec, IntCounterVec, IntGauge, IntGaugeVec, Opts,
+    Registry, TextEncoder,
     core::{AtomicI64, AtomicU64, GenericCounter, GenericGauge},
 };
 use std::{
-    sync::LazyLock,
-    time::{Duration, Instant},
+    sync::{Arc, LazyLock},
+    time::Instant,
 };
 
 const REQUEST_DURATION_BUCKETS: &[f64] = &[
     0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0,
 ];
+
+/// Values of the `status` label on `requests_total`.
+const REQUEST_STATUSES: [&str; 2] = ["ok", "error"];
 
 pub struct Metrics {
     registry: Registry,
@@ -20,13 +23,12 @@ pub struct Metrics {
     requests: IntCounterVec,
     request_duration: HistogramVec,
     requests_inflight: IntGaugeVec,
-    local_handler_duration: HistogramVec,
-    local_handler_inflight: IntGaugeVec,
+    local_handler: RequestMetrics,
     local_proxy_requests: IntCounterVec,
     remote_proxy_requests: IntCounterVec,
 }
 
-/// Metrics scoped to a particular tunnel server
+/// Metrics scoped to a particular tunnel server connection
 #[derive(Clone)]
 pub struct TunnelMetrics {
     opened: GenericGauge<AtomicI64>,
@@ -48,113 +50,88 @@ impl TunnelMetrics {
         self.connection_attempts.inc();
     }
 
-    pub fn start_request(&self) -> RequestGuard {
-        self.request_metrics.start()
+    pub fn request_metrics(&self) -> RequestMetrics {
+        self.request_metrics.clone()
     }
 }
 
+/// Which way a request travels through the tunnel client. Each direction also feeds the
+/// legacy `local_proxy_requests_total` / `remote_proxy_requests_total` counters.
+#[derive(Clone, Copy)]
+enum Direction {
+    Inbound,
+    Outbound,
+}
+
+impl Direction {
+    fn label(self) -> &'static str {
+        match self {
+            Direction::Inbound => "inbound",
+            Direction::Outbound => "outbound",
+        }
+    }
+}
+
+/// Counters incremented when a request finishes, one per outcome.
 #[derive(Clone)]
-pub struct RequestMetrics {
-    inflight: GenericGauge<AtomicI64>,
-    duration: Histogram,
+struct OutcomeCounters {
     ok: GenericCounter<AtomicU64>,
     error: GenericCounter<AtomicU64>,
+    legacy_success: GenericCounter<AtomicU64>,
+    legacy_error: GenericCounter<AtomicU64>,
 }
+
+struct RequestSeries {
+    inflight: GenericGauge<AtomicI64>,
+    duration: Histogram,
+    outcomes: Option<OutcomeCounters>,
+}
+
+/// Pre-resolved series for one (server, connection, direction), so that starting a request
+/// involves no label lookups or allocations. Cheap to clone.
+#[derive(Clone)]
+pub struct RequestMetrics(Arc<RequestSeries>);
 
 impl RequestMetrics {
     pub fn start(&self) -> RequestGuard {
-        self.inflight.inc();
+        self.0.inflight.inc();
         RequestGuard {
-            inflight: self.inflight.clone(),
-            duration: self.duration.clone(),
-            ok: self.ok.clone(),
-            error: self.error.clone(),
+            metrics: self.clone(),
             start: Instant::now(),
-            finished: false,
         }
     }
 }
 
+/// Tracks one in-flight request. `finish` is the only place an outcome is recorded;
+/// dropping the guard without finishing (e.g. a cancelled request) only releases the
+/// in-flight slot.
 pub struct RequestGuard {
-    inflight: GenericGauge<AtomicI64>,
-    duration: Histogram,
-    ok: GenericCounter<AtomicU64>,
-    error: GenericCounter<AtomicU64>,
+    metrics: RequestMetrics,
     start: Instant,
-    finished: bool,
 }
 
 impl RequestGuard {
-    pub fn finish(mut self, success: bool) {
-        self.observe(success);
-    }
-
-    fn observe(&mut self, success: bool) {
-        if self.finished {
-            return;
+    pub fn finish(self, success: bool) {
+        let series = &self.metrics.0;
+        series.duration.observe(self.start.elapsed().as_secs_f64());
+        if let Some(outcomes) = &series.outcomes {
+            match success {
+                true => {
+                    outcomes.ok.inc();
+                    outcomes.legacy_success.inc();
+                }
+                false => {
+                    outcomes.error.inc();
+                    outcomes.legacy_error.inc();
+                }
+            }
         }
-
-        self.duration.observe(elapsed_seconds(self.start.elapsed()));
-        if success {
-            self.ok.inc();
-        } else {
-            self.error.inc();
-        }
-        self.inflight.dec();
-        self.finished = true;
     }
 }
 
 impl Drop for RequestGuard {
     fn drop(&mut self) {
-        if !self.finished {
-            self.inflight.dec();
-        }
-    }
-}
-
-#[derive(Clone)]
-pub struct LocalHandlerMetrics {
-    inflight: GenericGauge<AtomicI64>,
-    duration: Histogram,
-}
-
-impl LocalHandlerMetrics {
-    pub fn start(&self) -> LocalHandlerGuard {
-        self.inflight.inc();
-        LocalHandlerGuard {
-            inflight: self.inflight.clone(),
-            duration: self.duration.clone(),
-            start: Instant::now(),
-            finished: false,
-        }
-    }
-}
-
-pub struct LocalHandlerGuard {
-    inflight: GenericGauge<AtomicI64>,
-    duration: Histogram,
-    start: Instant,
-    finished: bool,
-}
-
-impl LocalHandlerGuard {
-    pub fn finish(mut self) {
-        if self.finished {
-            return;
-        }
-
-        self.duration.observe(elapsed_seconds(self.start.elapsed()));
-        self.inflight.dec();
-        self.finished = true;
-    }
-}
-
-impl Drop for LocalHandlerGuard {
-    fn drop(&mut self) {
-        if !self.finished {
-            self.inflight.dec();
-        }
+        self.metrics.0.inflight.dec();
     }
 }
 
@@ -241,27 +218,25 @@ impl Metrics {
             .register(Box::new(requests_inflight.clone()))
             .expect("metric can be registered");
 
-        let local_handler_duration = HistogramVec::new(
+        let local_handler_duration = Histogram::with_opts(
             HistogramOpts::new(
                 "local_handler_duration_seconds",
                 "Time from forwarding to a local handler until response headers are received",
             )
             .namespace("restate_cloud_tunnel")
             .buckets(REQUEST_DURATION_BUCKETS.to_vec()),
-            &["instance"],
         )
         .expect("metric can be created");
         registry
             .register(Box::new(local_handler_duration.clone()))
             .expect("metric can be registered");
 
-        let local_handler_inflight = IntGaugeVec::new(
+        let local_handler_inflight = IntGauge::with_opts(
             Opts::new(
                 "local_handler_inflight",
                 "Requests currently waiting on a local handler response",
             )
             .namespace("restate_cloud_tunnel"),
-            &["instance"],
         )
         .expect("metric can be created");
         registry
@@ -302,8 +277,11 @@ impl Metrics {
             requests,
             request_duration,
             requests_inflight,
-            local_handler_duration,
-            local_handler_inflight,
+            local_handler: RequestMetrics(Arc::new(RequestSeries {
+                inflight: local_handler_inflight,
+                duration: local_handler_duration,
+                outcomes: None,
+            })),
             local_proxy_requests,
             remote_proxy_requests,
         }
@@ -320,7 +298,7 @@ impl Metrics {
         String::from_utf8(buffer).expect("metrics should be valid UTF-8")
     }
 
-    /// Create metrics scoped to a particular tunnel server
+    /// Create metrics scoped to a particular tunnel server connection
     pub fn tunnel(&self, server: &str, connection_index: usize) -> TunnelMetrics {
         let connection_index = connection_index.to_string();
 
@@ -334,65 +312,147 @@ impl Metrics {
             connection_attempts: self
                 .connection_attempts
                 .with_label_values(&[server, connection_index.as_str()]),
-            request_metrics: self.request(server, connection_index.as_str(), "inbound"),
+            request_metrics: self.request(server, connection_index.as_str(), Direction::Inbound),
         }
     }
 
-    pub fn request(&self, server: &str, connection: &str, direction: &str) -> RequestMetrics {
-        RequestMetrics {
-            inflight: self
-                .requests_inflight
-                .with_label_values(&[server, connection, direction]),
-            duration: self
-                .request_duration
-                .with_label_values(&[server, connection, direction]),
-            ok: self
-                .requests
-                .with_label_values(&[server, connection, direction, "ok"]),
-            error: self
-                .requests
-                .with_label_values(&[server, connection, direction, "error"]),
-        }
+    /// Metrics for requests proxied to Restate Cloud. The `connection` label is empty because
+    /// the outbound connection pool index is not a tunnel connection.
+    pub fn outbound_request(&self, server: &str) -> RequestMetrics {
+        self.request(server, "", Direction::Outbound)
     }
 
-    pub fn local_handler(&self, instance: &str) -> LocalHandlerMetrics {
-        LocalHandlerMetrics {
-            inflight: self.local_handler_inflight.with_label_values(&[instance]),
-            duration: self.local_handler_duration.with_label_values(&[instance]),
-        }
+    /// Metrics for the time spent waiting on local handlers, across all destinations.
+    pub fn local_handler(&self) -> RequestMetrics {
+        self.local_handler.clone()
     }
 
+    fn request(&self, server: &str, connection: &str, direction: Direction) -> RequestMetrics {
+        let direction_label = direction.label();
+        let (legacy_success, legacy_error) = match direction {
+            Direction::Inbound => (
+                self.local_proxy_requests.with_label_values(&["success"]),
+                self.local_proxy_requests.with_label_values(&["error"]),
+            ),
+            Direction::Outbound => (
+                self.remote_proxy_requests.with_label_values(&["success"]),
+                self.remote_proxy_requests.with_label_values(&["error"]),
+            ),
+        };
+
+        RequestMetrics(Arc::new(RequestSeries {
+            inflight: self.requests_inflight.with_label_values(&[
+                server,
+                connection,
+                direction_label,
+            ]),
+            duration: self.request_duration.with_label_values(&[
+                server,
+                connection,
+                direction_label,
+            ]),
+            outcomes: Some(OutcomeCounters {
+                ok: self
+                    .requests
+                    .with_label_values(&[server, connection, direction_label, "ok"]),
+                error: self.requests.with_label_values(&[
+                    server,
+                    connection,
+                    direction_label,
+                    "error",
+                ]),
+                legacy_success,
+                legacy_error,
+            }),
+        }))
+    }
+
+    /// Remove every series created by `tunnel` for this server, including inbound request series.
     pub fn remove_tunnel(&self, server: &str, count: usize) {
         for connection_index in 0..count {
             let connection_index = connection_index.to_string();
-            let labels = [server, connection_index.as_str()];
-
-            let _ = self.opened.remove_label_values(&labels);
-            let _ = self.draining.remove_label_values(&labels);
-            let _ = self.connection_attempts.remove_label_values(&labels);
-            let _ = self.requests_inflight.remove_label_values(&[
+            let tunnel_labels = [server, connection_index.as_str()];
+            let request_labels = [
                 server,
                 connection_index.as_str(),
-                "inbound",
-            ]);
+                Direction::Inbound.label(),
+            ];
+
+            let _ = self.opened.remove_label_values(&tunnel_labels);
+            let _ = self.draining.remove_label_values(&tunnel_labels);
+            let _ = self.connection_attempts.remove_label_values(&tunnel_labels);
+            let _ = self.requests_inflight.remove_label_values(&request_labels);
+            let _ = self.request_duration.remove_label_values(&request_labels);
+            for status in REQUEST_STATUSES {
+                let _ = self.requests.remove_label_values(&[
+                    request_labels[0],
+                    request_labels[1],
+                    request_labels[2],
+                    status,
+                ]);
+            }
         }
-    }
-
-    pub fn record_local_proxy_request(&self, success: bool) {
-        self.local_proxy_requests
-            .with_label_values(&[if success { "success" } else { "error" }])
-            .inc();
-    }
-
-    pub fn record_remote_proxy_request(&self, success: bool) {
-        self.remote_proxy_requests
-            .with_label_values(&[if success { "success" } else { "error" }])
-            .inc();
     }
 }
 
 pub static METRICS: LazyLock<Metrics> = LazyLock::new(Metrics::new);
 
-fn elapsed_seconds(duration: Duration) -> f64 {
-    duration.as_secs_f64()
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn series_count(metrics: &Metrics, server: &str) -> usize {
+        metrics
+            .render()
+            .lines()
+            .filter(|line| line.contains(&format!("server=\"{server}\"")))
+            .count()
+    }
+
+    #[test]
+    fn remove_tunnel_removes_every_inbound_series() {
+        let metrics = Metrics::new();
+        let tunnel = metrics.tunnel("tunnel.test:443", 0);
+        tunnel.opened(true);
+        tunnel.draining(true);
+        tunnel.inc_connection_attempts();
+        tunnel.request_metrics().start().finish(true);
+        tunnel.request_metrics().start().finish(false);
+        assert!(series_count(&metrics, "tunnel.test:443") > 0);
+
+        metrics.remove_tunnel("tunnel.test:443", 1);
+
+        assert_eq!(series_count(&metrics, "tunnel.test:443"), 0);
+    }
+
+    #[test]
+    fn finish_records_requests_total_and_legacy_counter_once() {
+        let metrics = Metrics::new();
+        metrics
+            .outbound_request("cloud.test:8080")
+            .start()
+            .finish(false);
+
+        let rendered = metrics.render();
+        assert!(rendered.contains(
+            "restate_cloud_tunnel_requests_total{connection=\"\",direction=\"outbound\",server=\"cloud.test:8080\",status=\"error\"} 1"
+        ));
+        assert!(
+            rendered
+                .contains("restate_cloud_tunnel_remote_proxy_requests_total{status=\"error\"} 1")
+        );
+        assert!(rendered.contains("restate_cloud_tunnel_requests_inflight{connection=\"\",direction=\"outbound\",server=\"cloud.test:8080\"} 0"));
+    }
+
+    #[test]
+    fn dropped_guard_releases_inflight_without_recording_outcome() {
+        let metrics = Metrics::new();
+        let request_metrics = metrics.outbound_request("cloud.test:9070");
+        let guard = request_metrics.start();
+        drop(guard);
+
+        let rendered = metrics.render();
+        assert!(rendered.contains("restate_cloud_tunnel_requests_inflight{connection=\"\",direction=\"outbound\",server=\"cloud.test:9070\"} 0"));
+        assert!(rendered.contains("restate_cloud_tunnel_requests_total{connection=\"\",direction=\"outbound\",server=\"cloud.test:9070\",status=\"ok\"} 0"));
+    }
 }

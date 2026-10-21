@@ -605,6 +605,10 @@ async fn handle_tunnel_uri<Notify, Client, ClientError, ClientFuture, ResponseBo
     metrics.opened(false);
     metrics.draining(false);
 
+    // Connections told to drain keep serving in-flight requests after a replacement is started.
+    // The tunnel reports Draining only while at least one of them is still running.
+    let drained_running = Arc::new(AtomicUsize::new(0));
+
     loop {
         let handler = handler.clone();
         let on_drain = CancellationToken::new();
@@ -643,7 +647,6 @@ async fn handle_tunnel_uri<Notify, Client, ClientError, ClientFuture, ResponseBo
             Ok(())
         }));
         let mut opened = false;
-        let mut draining = false;
 
         loop {
             tokio::select! {
@@ -669,10 +672,11 @@ async fn handle_tunnel_uri<Notify, Client, ClientError, ClientFuture, ResponseBo
                     break
                 }
                 _ = on_drain.cancelled() => {
-                    let _ = status.send(TunnelStatus::Draining);
-                    draining = true;
+                    drained_running.fetch_add(1, Ordering::SeqCst);
                     metrics.draining(true);
                     let metrics = metrics.clone();
+                    let status = status.clone();
+                    let drained_running = drained_running.clone();
                     tokio::task::spawn(async move {
                         match tokio::time::timeout(Duration::from_secs(120), &mut handle).await {
                             Ok(Ok(ServeError::ClientClosed(status))) => {
@@ -694,6 +698,16 @@ async fn handle_tunnel_uri<Notify, Client, ClientError, ClientFuture, ResponseBo
                             }
                         }
                         metrics.draining(false);
+                        drained_running.fetch_sub(1, Ordering::SeqCst);
+                        // Only the backoff sleep reports Draining; a newer connection's status must stand.
+                        status.send_if_modified(|status| {
+                            let still_sleeping = matches!(status, TunnelStatus::Draining)
+                                && drained_running.load(Ordering::SeqCst) == 0;
+                            if still_sleeping {
+                                *status = TunnelStatus::BackingOff;
+                            }
+                            still_sleeping
+                        });
                     }.in_current_span());
                     info!("Server requested drain; starting new tunnel connection");
                     break
@@ -707,10 +721,13 @@ async fn handle_tunnel_uri<Notify, Client, ClientError, ClientFuture, ResponseBo
         }
 
         metrics.opened(false);
-        let _ = status.send(if draining {
-            TunnelStatus::Draining
-        } else {
-            TunnelStatus::BackingOff
+        // Evaluated under the watch lock so it serializes with a drained connection exiting.
+        status.send_modify(|status| {
+            *status = if drained_running.load(Ordering::SeqCst) > 0 {
+                TunnelStatus::Draining
+            } else {
+                TunnelStatus::BackingOff
+            };
         });
 
         tokio::select! {

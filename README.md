@@ -28,6 +28,20 @@ In addition to exposing local services to Restate Cloud, by default the tunnel c
 and admin endpoints from Restate Cloud on its local 8080 and 9080 ports. This behaviour can be disabled with `RESTATE_REMOTE_PROXY=false`. If left enabled, be careful to restrict access to these ports;
 access to them is equivalent to having the configured `RESTATE_AUTH_TOKEN`.
 
+## GCP auth
+By default, requests from Restate Cloud are forwarded to your services with their headers unchanged, and
+your services verify the request signature to check that requests come from your environment. If your
+services run on Cloud Run with invoker IAM enforced, set `RESTATE_GCP_AUTH=true` to have the client attach
+`Authorization: Bearer <Google ID token>` to every request proxied to an `https` destination. The token is
+minted by the GCE / Cloud Run metadata server for the service account the client runs as, with audience
+`https://<destination host>`; grant that service account `roles/run.invoker` on the destination services.
+Tokens are cached per audience and refreshed every 50 minutes.
+
+If a token cannot be obtained the request is answered with `502` and
+`restate_cloud_tunnel_gcp_auth_failures_total` is incremented. Any `Authorization` header already present on
+the request is replaced. Cleartext (`http`) destinations are always proxied unchanged. `GCE_METADATA_HOST`
+overrides the metadata server host, e.g. for testing outside Google Cloud.
+
 ## Releasing
 1. Update the version in Cargo.{toml,lock} eg to 0.0.2
 2. Push a new tag v0.0.2

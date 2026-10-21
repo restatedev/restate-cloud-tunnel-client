@@ -1,5 +1,5 @@
 use prometheus::{
-    Encoder, IntCounterVec, IntGaugeVec, Opts, Registry, TextEncoder,
+    Encoder, IntCounter, IntCounterVec, IntGaugeVec, Opts, Registry, TextEncoder,
     core::{AtomicI64, AtomicU64, GenericCounter, GenericGauge},
 };
 use std::sync::LazyLock;
@@ -10,6 +10,7 @@ pub struct Metrics {
     draining: IntGaugeVec,
     connection_attempts: IntCounterVec,
     local_proxy_requests: IntCounterVec,
+    gcp_auth_failures: IntCounter,
     remote_proxy_requests: IntCounterVec,
 }
 
@@ -91,6 +92,18 @@ impl Metrics {
             .register(Box::new(local_proxy_requests.clone()))
             .expect("metric can be registered");
 
+        let gcp_auth_failures = IntCounter::with_opts(
+            Opts::new(
+                "gcp_auth_failures_total",
+                "Total requests from Restate Cloud rejected because a Google ID token could not be obtained",
+            )
+            .namespace("restate_cloud_tunnel"),
+        )
+        .expect("metric can be created");
+        registry
+            .register(Box::new(gcp_auth_failures.clone()))
+            .expect("metric can be registered");
+
         let remote_proxy_requests = IntCounterVec::new(
             Opts::new(
                 "remote_proxy_requests_total",
@@ -110,6 +123,7 @@ impl Metrics {
             draining,
             connection_attempts,
             local_proxy_requests,
+            gcp_auth_failures,
             remote_proxy_requests,
         }
     }
@@ -145,6 +159,10 @@ impl Metrics {
         self.local_proxy_requests
             .with_label_values(&[if success { "success" } else { "error" }])
             .inc();
+    }
+
+    pub fn record_gcp_auth_failure(&self) {
+        self.gcp_auth_failures.inc();
     }
 
     pub fn record_remote_proxy_request(&self, success: bool) {

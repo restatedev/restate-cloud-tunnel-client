@@ -55,6 +55,8 @@ struct OptionsShadow {
     ingress_uri: Option<Uri>,
     #[serde_as(as = "Option<serde_with::DisplayFromStr>")]
     admin_uri: Option<Uri>,
+
+    gcp_auth: bool,
 }
 
 impl Default for OptionsShadow {
@@ -96,6 +98,7 @@ impl Default for OptionsShadow {
             cloud_region: None,
             ingress_uri: None,
             admin_uri: None,
+            gcp_auth: false,
         }
     }
 }
@@ -122,6 +125,9 @@ pub struct Options {
 
     pub admin_serve_address: SocketAddr,
     pub admin_uri: Uri,
+
+    /// Attach a Google ID token to requests proxied to local https services
+    pub gcp_auth: bool,
 }
 
 impl Options {
@@ -297,6 +303,7 @@ impl Options {
             ingress_uri,
             admin_serve_address: shadow.admin_serve_address,
             admin_uri,
+            gcp_auth: shadow.gcp_auth,
         })
     }
 }

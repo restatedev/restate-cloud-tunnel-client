@@ -89,8 +89,8 @@ pub async fn main() -> anyhow::Result<()> {
     builder
         .http2_initial_max_send_streams(options.initial_max_send_streams)
         .http2_adaptive_window(true)
-        .http2_keep_alive_timeout(options.http_keep_alive_options.timeout.into())
-        .http2_keep_alive_interval(Some(options.http_keep_alive_options.interval.into()));
+        .http2_keep_alive_timeout(options.http_keep_alive_options.timeout.to_std())
+        .http2_keep_alive_interval(Some(options.http_keep_alive_options.interval.to_std()));
 
     let mut http_connector = HttpConnector::new();
     http_connector.enforce_http(false);
@@ -1022,7 +1022,8 @@ mod tests {
 
     #[test]
     fn test_parse_tunnel_destination_missing_leading_slash() {
-        let path_and_query = PathAndQuery::from_static("http/example.com/8080/api");
+        // http >= 1.5 refuses other paths without a leading slash when parsing.
+        let path_and_query = PathAndQuery::from_static("*");
         let result = parse_tunnel_destination(&path_and_query);
 
         assert_eq!(result, Err("no leading /"));

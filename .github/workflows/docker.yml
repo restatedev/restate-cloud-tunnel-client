@@ -7,6 +7,9 @@ on:
 jobs:
   build-docker-image:
     name: Build docker image
+    permissions:
+      contents: read
+      packages: write
     uses: restatedev/restate/.github/workflows/docker.yml@main
     secrets: inherit
     with:

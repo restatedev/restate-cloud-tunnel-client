@@ -26,12 +26,17 @@ jobs:
 
   build-docker-image:
     name: Build release Docker image
+    permissions:
+      contents: read
+      packages: write
     needs: [verify-release-commit]
     uses: ./.github/workflows/docker.yml
     secrets: inherit
 
   publish-release:
     name: Publish release
+    permissions:
+      contents: write
     runs-on: ubuntu-latest
     needs: [build-docker-image]
 

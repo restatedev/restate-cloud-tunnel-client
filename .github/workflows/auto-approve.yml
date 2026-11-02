@@ -27,7 +27,7 @@ jobs:
 
       - name: Notify Slack of auto-approval
         if: ${{ success() && steps.auto_approve.conclusion == 'success' }}
-        uses: rtCamp/action-slack-notify@639bbe0ee9b68d0140259ac541b898f3791916f9 # v2.4.0
+        uses: rtCamp/action-slack-notify@v2.4.0
         env:
           SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK_URL }}
           SLACK_USERNAME: github-bot

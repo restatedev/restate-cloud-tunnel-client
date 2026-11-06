@@ -15,12 +15,30 @@ use figment::{
 };
 use futures::{StreamExt, stream::BoxStream};
 use http::Uri;
-use restate_types::config::Http2KeepAliveOptions;
+use restate_util_time::NonZeroFriendlyDuration;
 use serde::{Deserialize, Serialize};
 use serde_with::serde_as;
 use tracing::info;
 
 use crate::srv::{HickoryResolver, Resolver, ServerName, fixed_uri_stream};
+
+/// HTTP/2 keep-alive settings, defined here so the `interval` and `timeout`
+/// config keys stay stable across restate-types releases.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct Http2KeepAliveOptions {
+    pub interval: NonZeroFriendlyDuration,
+    pub timeout: NonZeroFriendlyDuration,
+}
+
+impl Default for Http2KeepAliveOptions {
+    fn default() -> Self {
+        Self {
+            interval: NonZeroFriendlyDuration::from_secs_unchecked(40),
+            timeout: NonZeroFriendlyDuration::from_secs_unchecked(20),
+        }
+    }
+}
 
 #[serde_as]
 #[derive(Serialize, Deserialize)]

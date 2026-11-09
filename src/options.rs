@@ -353,6 +353,11 @@ impl Options {
 
 #[cfg(test)]
 mod tests {
+    // figment::Jail's closure signature forces `Result<_, figment::Error>`,
+    // and figment::Error is ~208 bytes, which trips clippy::result_large_err
+    // under Rust 1.98.
+    #![allow(clippy::result_large_err)]
+
     use figment::Jail;
 
     use super::*;

@@ -15,6 +15,11 @@ updates:
       semver-minor-days: 3
       semver-patch-days: 3
     open-pull-requests-limit: 5
+    ignore:
+      # hickory-resolver 0.26 is a breaking (0.x "major") bump that reorganized the Name,
+      # error and lookup APIs; it needs a scheduled code port (issue #37). Remove once done.
+      - dependency-name: "hickory-resolver"
+        versions: [">= 0.26"]
     groups:
       # rustls, aws-lc and ring move as one cryptographic stack; a split bump
       # (notably an aws-lc-sys major) fails to build, more so against musl.

@@ -17,7 +17,8 @@ updates:
     open-pull-requests-limit: 5
     ignore:
       # hickory-resolver 0.26 is a breaking (0.x "major") bump that reorganized the Name,
-      # error and lookup APIs; it needs a scheduled code port (issue #37). Remove once done.
+      # error and lookup APIs; it needs a scheduled code port (restatedev/restate-cloud#2503).
+      # Remove once done.
       - dependency-name: "hickory-resolver"
         versions: [">= 0.26"]
     groups:

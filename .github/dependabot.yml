@@ -16,6 +16,20 @@ updates:
       semver-patch-days: 3
     open-pull-requests-limit: 2
     groups:
+      # rustls, aws-lc and ring move as one cryptographic stack; a split bump
+      # (notably an aws-lc-sys major) fails to build, more so against musl.
+      rustls-aws-lc:
+        patterns:
+          - "rustls*"
+          - "aws-lc*"
+          - "ring"
+          - "webpki*"
+      # tonic re-exports a specific prost and the generated code must match it,
+      # so they only interoperate at the versions they were built against.
+      tonic-prost:
+        patterns:
+          - "tonic*"
+          - "prost*"
       cargo-nonmajor:
         patterns:
           - "*"

@@ -185,3 +185,6 @@ impl Resolver for HickoryResolver {
         Ok((uris, valid_until))
     }
 }
+
+#[cfg(test)]
+mod tests;

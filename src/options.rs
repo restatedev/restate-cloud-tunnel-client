@@ -520,10 +520,9 @@ admin-uri = "https://admin.example.com:9070/"
                 "cloud-region" => shadow.cloud_region.unwrap(),
                 _ => shadow.tunnel_servers_srv.unwrap(),
             };
-            assert_eq!(
-                actual.to_string().trim_end_matches('.'),
-                value.trim_end_matches('.')
-            );
+            let expected = Name::from_utf8(value).unwrap();
+            assert_eq!(actual, expected);
+            assert_eq!(actual.is_fqdn(), expected.is_fqdn());
         }
     }
 }

@@ -140,21 +140,34 @@ impl Fixture {
     }
 
     fn resolver_with_strategy(&self, ip_strategy: LookupIpStrategy) -> HickoryResolver {
-        let mut connection = ConnectionConfig::tcp();
-        connection.port = self.addr.port();
-        connection.bind_addr = Some(SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 0));
-        let config = ResolverConfig::from_name_servers(vec![NameServerConfig::new(
-            self.addr.ip(),
-            true,
-            vec![connection],
-        )]);
+        self.resolver_with_servers(Some(ip_strategy), &[self.addr])
+    }
+
+    fn resolver_with_servers(
+        &self,
+        ip_strategy: Option<LookupIpStrategy>,
+        servers: &[SocketAddr],
+    ) -> HickoryResolver {
+        let config = ResolverConfig::from_name_servers(
+            servers
+                .iter()
+                .map(|addr| {
+                    let mut connection = ConnectionConfig::tcp();
+                    connection.port = addr.port();
+                    connection.bind_addr = Some(SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 0));
+                    NameServerConfig::new(addr.ip(), true, vec![connection])
+                })
+                .collect(),
+        );
 
         let mut options = ResolverOpts::default();
+        super::preserve_resolver_policy(&mut options);
         options.timeout = self.dns_timeout;
         options.attempts = 1;
-        options.ip_strategy = ip_strategy;
+        if let Some(ip_strategy) = ip_strategy {
+            options.ip_strategy = ip_strategy;
+        }
         options.use_hosts_file = ResolveHosts::Never;
-        options.cache_size = 32;
         options.edns0 = false;
         options.num_concurrent_reqs = 1;
         options.server_ordering_strategy = ServerOrderingStrategy::UserProvidedOrder;
@@ -165,6 +178,7 @@ impl Fixture {
                 .with_options(options)
                 .build()
                 .expect("fixture resolver config"),
+            Mutex::default(),
         )
     }
 }
@@ -620,6 +634,109 @@ async fn target_transport_errors_abort() {
 }
 
 #[tokio::test]
+async fn target_a_transport_failure_can_end_as_negative() {
+    for action in [Action::Malformed, Action::Drop] {
+        let fixture = target_fixture(action, true, false).await;
+        let (uris, expiry) =
+            resolve_with_strategy(&fixture, "_svc.test", LookupIpStrategy::Ipv4thenIpv6)
+                .await
+                .unwrap();
+        assert_healthy(uris, true);
+        assert_expiry(expiry, 60);
+        assert!(fixture.seen.contains("failed.test", RecordType::A));
+        assert!(fixture.seen.contains("failed.test", RecordType::AAAA));
+    }
+}
+
+#[tokio::test]
+async fn target_server_errors_preserve_previous_endpoints() {
+    for negative in [
+        Reply::new(ResponseCode::NXDomain),
+        Reply::no_error(),
+        Reply::new(ResponseCode::NXDomain).authority(soa("test", 8, 3)),
+        Reply::no_error().authority(soa("test", 8, 3)),
+    ] {
+        let good = Action::Reply(Reply::no_error().answer(a("failed.test", 120, "10.0.6.2")));
+        let bad = target_fixture(good.clone(), true, false).await;
+        let healthy = target_fixture(good, true, false).await;
+        let resolver = bad.resolver_with_servers(None, &[bad.addr, healthy.addr]);
+        let expected = ["https://10.0.6.1:8443/", "https://10.0.6.2:8444/"];
+        assert_uris(
+            resolver.resolve_srv(name("_svc.test")).await.unwrap().0,
+            &expected,
+        );
+        // The other TCP server can still answer the target successfully.
+        assert_uris(resolve(&healthy, "_svc.test").await.unwrap().0, &expected);
+        for ty in [RecordType::A, RecordType::AAAA] {
+            bad.set(
+                "failed.test",
+                ty,
+                Action::Reply(Reply::new(ResponseCode::ServFail)),
+            );
+        }
+        for _ in 0..2 {
+            let (uris, expiry) = resolver.resolve_srv(name("_svc.test")).await.unwrap();
+            assert_uris(uris, &expected);
+            assert_expiry(expiry, 60);
+        }
+        // A genuine negative must remove the saved endpoints, with or without SOA.
+        for ty in [RecordType::A, RecordType::AAAA] {
+            bad.set("failed.test", ty, Action::Reply(negative.clone()));
+        }
+        assert_healthy(
+            resolver.resolve_srv(name("_svc.test")).await.unwrap().0,
+            true,
+        );
+        for ty in [RecordType::A, RecordType::AAAA] {
+            bad.set(
+                "failed.test",
+                ty,
+                Action::Reply(Reply::new(ResponseCode::ServFail)),
+            );
+        }
+        assert_healthy(
+            resolver.resolve_srv(name("_svc.test")).await.unwrap().0,
+            true,
+        );
+    }
+}
+
+#[tokio::test]
+async fn zero_ttl_refreshes_wait_before_querying_again() {
+    for (srv_ttl, address_ttl, negative) in [(0, 120, false), (120, 0, false), (120, 120, true)] {
+        let fixture = target_fixture(
+            Action::Reply(if negative {
+                Reply::new(ResponseCode::NXDomain).authority(soa("test", 120, 0))
+            } else {
+                Reply::no_error().answer(a("failed.test", address_ttl, "10.0.6.2"))
+            }),
+            false,
+            false,
+        )
+        .await;
+        fixture.set(
+            "_svc.test",
+            RecordType::SRV,
+            Action::Reply(Reply::no_error().answer(srv("_svc.test", srv_ttl, 8444, "failed.test"))),
+        );
+        let mut updates = Box::pin(fixture.resolver().into_stream(name("_svc.test")));
+        updates.next().await.unwrap();
+        let started = Instant::now();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), updates.next())
+                .await
+                .is_err(),
+            "zero TTL caused immediate refresh"
+        );
+        tokio::time::timeout(Duration::from_secs(2), updates.next())
+            .await
+            .expect("refresh after floor")
+            .unwrap();
+        assert!(started.elapsed() >= Duration::from_secs(1));
+    }
+}
+
+#[tokio::test]
 async fn srv_failures_propagate() {
     for action in [
         Action::Reply(Reply::new(ResponseCode::NXDomain)),
@@ -658,10 +775,11 @@ async fn ipv4_policy_ignores_other_family_glue() {
     ])
     .await;
 
-    let (uris, valid_until) =
-        resolve_with_strategy(&fixture, "_svc.dual.test", LookupIpStrategy::Ipv4thenIpv6)
-            .await
-            .unwrap();
+    let (uris, valid_until) = fixture
+        .resolver_with_servers(None, &[fixture.addr])
+        .resolve_srv(name("_svc.dual.test"))
+        .await
+        .unwrap();
     // The AAAA glue in the same reply must not be published, and the SRV TTL is the
     // earliest relevant record.
     assert_uris(uris, &["https://10.0.5.1:8443/"]);
@@ -690,7 +808,9 @@ async fn ipv4_policy_ignores_other_family_glue() {
     .await;
 
     assert!(
-        resolve_with_strategy(&fixture, "_svc.v6.test", LookupIpStrategy::Ipv4thenIpv6,)
+        fixture
+            .resolver_with_servers(None, &[fixture.addr])
+            .resolve_srv(name("_svc.v6.test"))
             .await
             .is_err(),
         "IPv6-only endpoints fail in the existing URI construction"
@@ -1056,7 +1176,7 @@ async fn production_constructor_preserves_resolver_policy() {
     assert_eq!(options.ip_strategy, LookupIpStrategy::Ipv4thenIpv6);
     assert_eq!(options.cache_size, 32);
     assert_eq!(options.max_active_requests, 33);
-    // Unix inherits resolv.conf; Windows must retain the old disabled EDNS default.
-    #[cfg(windows)]
+    // Linux inherits resolv.conf; Windows and Apple retain disabled EDNS.
+    #[cfg(any(windows, target_vendor = "apple"))]
     assert!(!options.edns0);
 }

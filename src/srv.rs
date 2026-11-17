@@ -3,13 +3,14 @@ use std::{
     fmt::Display,
     net::IpAddr,
     str::FromStr,
+    sync::Mutex,
     time::{Duration, Instant},
 };
 
 use futures::{Stream, StreamExt, TryStreamExt, stream::FuturesUnordered};
 use hickory_resolver::{
     TokioResolver,
-    config::LookupIpStrategy,
+    config::{LookupIpStrategy, ResolverOpts},
     lookup::Lookup,
     lookup_ip::LookupIp,
     net::{DnsError, NetError},
@@ -91,6 +92,8 @@ pub trait Resolver: Sized {
                     .map(|uri| (uri, server_name.clone()))
                     .collect();
 
+                // Even zero-TTL answers must leave a pause between full query rounds.
+                let valid_until = valid_until.max(Instant::now() + Duration::from_secs(1));
                 break Some((uris_with_name, (resolver, srv, Some(valid_until))));
             }
         })
@@ -100,7 +103,22 @@ pub trait Resolver: Sized {
 #[cfg(test)]
 mod tests;
 
-pub struct HickoryResolver(TokioResolver);
+type PreviousEndpoints = HashMap<(Name, Name, u16), HashSet<Uri>>;
+
+pub struct HickoryResolver(TokioResolver, Mutex<PreviousEndpoints>);
+
+fn preserve_resolver_policy(options: &mut ResolverOpts) {
+    // Keep the 0.25 cache, in-flight request guard and IPv4 preference.
+    options.ip_strategy = LookupIpStrategy::Ipv4thenIpv6;
+    options.cache_size = 32;
+    options.max_active_requests = 33;
+    #[cfg(any(windows, target_vendor = "apple"))]
+    {
+        // These platforms use native configuration with the new EDNS default.
+        // Linux retains resolv.conf's explicit EDNS policy.
+        options.edns0 = false;
+    }
+}
 
 impl HickoryResolver {
     pub fn new() -> Self {
@@ -108,22 +126,12 @@ impl HickoryResolver {
         // resulting options. The resolver is a process-wide singleton, so fail loudly.
         let mut builder =
             TokioResolver::builder_tokio().expect("system resolver configuration must be readable");
-        // Pin the old resolver defaults that changed in hickory-resolver 0.26:
-        // keep the 32-entry cache and the effective 33 in-flight request guard, and
-        // prefer IPv4 so an IPv6-only answer cannot replace a working IPv4 endpoint.
-        builder.options_mut().ip_strategy = LookupIpStrategy::Ipv4thenIpv6;
-        builder.options_mut().cache_size = 32;
-        builder.options_mut().max_active_requests = 33;
-        #[cfg(windows)]
-        {
-            // Windows has no resolver options file, so the parsed options retain the
-            // 0.26 default of EDNS enabled; 0.25 defaulted to disabled there.
-            builder.options_mut().edns0 = false;
-        }
+        preserve_resolver_policy(builder.options_mut());
         Self(
             builder
                 .build()
                 .expect("system resolver configuration must be valid"),
+            Mutex::default(),
         )
     }
 }
@@ -137,21 +145,25 @@ enum TargetResolution {
     },
     /// The target is known not to exist; omit it and re-query after `valid_until`.
     Negative { valid_until: Instant },
+    /// A server failed; retain this target's last published endpoints until retry.
+    ServerError { valid_until: Instant },
 }
 
 impl TargetResolution {
     fn valid_until(&self) -> Instant {
         match self {
             TargetResolution::Addresses { valid_until, .. }
-            | TargetResolution::Negative { valid_until } => *valid_until,
+            | TargetResolution::Negative { valid_until }
+            | TargetResolution::ServerError { valid_until } => *valid_until,
         }
     }
 }
 
 /// Server response codes that 0.25 reported as a negative answer without a negative TTL
 /// (`ProtoErrorKind::NoRecordsFound { negative_ttl: None, .. }`). For those, and only
-/// those, the old client omitted the target and retried it after 60 seconds instead of
-/// failing the whole discovery. Everything else stays a hard error.
+/// those, retry after 60 seconds instead of failing the whole discovery. Unlike a
+/// genuine negative, preserve previous endpoints because 0.26 may stop before trying
+/// the other nameservers. Everything else stays a hard error.
 const SERVER_ERROR_RETRY_CODES: &[ResponseCode] = &[
     ResponseCode::ServFail,
     ResponseCode::Refused,
@@ -329,9 +341,14 @@ impl Resolver for HickoryResolver {
                 let resolution = match self.0.lookup_ip(target.clone()).await {
                     Ok(lookup_ip) => resolved_target(&target, lookup_ip),
                     Err(err) => match negative_retry_delay(&err) {
-                        Some(delay) => TargetResolution::Negative {
-                            valid_until: Instant::now() + delay,
-                        },
+                        Some(delay) => {
+                            let valid_until = Instant::now() + delay;
+                            if matches!(&err, NetError::Dns(DnsError::ResponseCode(code)) if SERVER_ERROR_RETRY_CODES.contains(code)) {
+                                TargetResolution::ServerError { valid_until }
+                            } else {
+                                TargetResolution::Negative { valid_until }
+                            }
+                        }
                         None => return Err(err.into()),
                     },
                 };
@@ -345,17 +362,28 @@ impl Resolver for HickoryResolver {
             valid_until = valid_until.min(resolution.valid_until());
         }
 
+        let mut previous = self.1.lock().expect("previous endpoints lock poisoned");
+        let mut current = HashMap::new();
         let mut uris = HashSet::new();
         for (target, port, _) in &srv_records {
-            let Some(TargetResolution::Addresses { addresses, .. }) =
-                target_resolutions.get(target)
-            else {
-                continue;
+            let key = (srv.clone(), target.clone(), *port);
+            let endpoints = match target_resolutions.get(target) {
+                Some(TargetResolution::Addresses { addresses, .. }) => addresses
+                    .iter()
+                    .map(|address| endpoint_uri(*address, *port))
+                    .collect::<anyhow::Result<HashSet<_>>>()?,
+                Some(TargetResolution::ServerError { .. }) => {
+                    previous.get(&key).cloned().unwrap_or_default()
+                }
+                _ => HashSet::new(),
             };
-            for address in addresses {
-                uris.insert(endpoint_uri(*address, *port)?);
-            }
+            uris.extend(endpoints.iter().cloned());
+            current.insert(key, endpoints);
         }
+        // Commit only a complete successful discovery. Removed SRV records and genuine
+        // negatives must not be resurrected by a later server error.
+        previous.retain(|(service, _, _), _| service != &srv);
+        previous.extend(current);
 
         Ok((uris, valid_until))
     }

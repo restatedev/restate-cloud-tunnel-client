@@ -14,7 +14,7 @@ use figment::{
     value::Dict,
 };
 use futures::{StreamExt, stream::BoxStream};
-use hickory_resolver::Name;
+use hickory_resolver::proto::rr::Name;
 use http::Uri;
 use restate_types::config::Http2KeepAliveOptions;
 use serde::{Deserialize, Serialize};

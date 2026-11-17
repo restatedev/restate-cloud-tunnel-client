@@ -13,19 +13,18 @@ use std::{
 use super::{HickoryResolver, Resolver as _, ServerName, fixed_uri_stream};
 use futures::StreamExt;
 use hickory_resolver::{
-    Resolver,
+    TokioResolver,
     config::{
-        LookupIpStrategy, NameServerConfig, ResolveHosts, ResolverConfig, ResolverOpts,
-        ServerOrderingStrategy,
+        ConnectionConfig, LookupIpStrategy, NameServerConfig, ResolveHosts, ResolverConfig,
+        ResolverOpts, ServerOrderingStrategy,
     },
-    name_server::TokioConnectionProvider,
+    net::runtime::TokioRuntimeProvider,
     proto::{
         op::{Message, MessageType, ResponseCode},
         rr::{
-            Name, RData, Record, RecordType,
+            DNSClass, Name, RData, Record, RecordType,
             rdata::{A, AAAA, CNAME, SOA, SRV},
         },
-        xfer::Protocol,
     },
 };
 use tokio::{
@@ -141,10 +140,14 @@ impl Fixture {
     }
 
     fn resolver_with_strategy(&self, ip_strategy: LookupIpStrategy) -> HickoryResolver {
-        let mut config = ResolverConfig::new();
-        let mut name_server = NameServerConfig::new(self.addr, Protocol::Tcp);
-        name_server.bind_addr = Some(SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 0));
-        config.add_name_server(name_server);
+        let mut connection = ConnectionConfig::tcp();
+        connection.port = self.addr.port();
+        connection.bind_addr = Some(SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 0));
+        let config = ResolverConfig::from_name_servers(vec![NameServerConfig::new(
+            self.addr.ip(),
+            true,
+            vec![connection],
+        )]);
 
         let mut options = ResolverOpts::default();
         options.timeout = self.dns_timeout;
@@ -158,9 +161,10 @@ impl Fixture {
         options.try_tcp_on_error = false;
 
         HickoryResolver(
-            Resolver::builder_with_config(config, TokioConnectionProvider::default())
+            TokioResolver::builder_with_config(config, TokioRuntimeProvider::default())
                 .with_options(options)
-                .build(),
+                .build()
+                .expect("fixture resolver config"),
         )
     }
 }
@@ -172,7 +176,8 @@ enum Served {
 }
 
 fn response_for(entries: &Entries, seen: &SeenQueries, request: &Message) -> Served {
-    let Some(query) = request.query() else {
+    // 0.26 exposes the query section as a plain vector; this fixture always sends one.
+    let Some(query) = request.queries.first() else {
         return Served::Drop;
     };
     let name = normalize(&query.name().to_utf8());
@@ -193,20 +198,17 @@ fn response_for(entries: &Entries, seen: &SeenQueries, request: &Message) -> Ser
         Action::Drop => return Served::Drop,
     };
 
-    let mut response = Message::new();
-    response
-        .set_id(request.id())
-        .set_op_code(request.op_code())
-        .set_message_type(MessageType::Response)
-        .set_response_code(reply.rcode)
-        .set_authoritative(true)
-        .set_recursion_available(true)
-        .add_query(query.clone());
+    let mut response = Message::response(request.metadata.id, request.metadata.op_code);
+    response.metadata.message_type = MessageType::Response;
+    response.metadata.response_code = reply.rcode;
+    response.metadata.authoritative = true;
+    response.metadata.recursion_available = true;
+    response.add_query(query.clone());
     for record in reply.answers {
         response.add_answer(record);
     }
     for record in reply.authority {
-        response.add_name_server(record);
+        response.add_authority(record);
     }
     for record in reply.additionals {
         response.add_additional(record);
@@ -996,4 +998,65 @@ async fn fixed_uri_stream_is_stable() {
             .is_err(),
         "a fixed endpoint map is published once and then stays pending"
     );
+}
+
+// 0.26 rejects foreign-class responses before the client's owner filtering.
+#[tokio::test]
+async fn foreign_class_responses_fail() {
+    for target in [false, true] {
+        let fixture = target_fixture(
+            Action::Reply(Reply::no_error().answer(a("failed.test", 30, "10.0.0.1"))),
+            true,
+            false,
+        )
+        .await;
+        if target {
+            let mut foreign = a("failed.test", 30, "10.0.0.99");
+            foreign.dns_class = DNSClass::CH;
+            fixture.set(
+                "failed.test",
+                RecordType::A,
+                Action::Reply(
+                    Reply::no_error()
+                        .answer(a("failed.test", 30, "10.0.0.1"))
+                        .answer(foreign),
+                ),
+            );
+        } else {
+            let mut foreign = srv("_svc.test", 30, 9999, "healthy.test");
+            foreign.dns_class = DNSClass::CH;
+            fixture.set(
+                "_svc.test",
+                RecordType::SRV,
+                Action::Reply(
+                    Reply::no_error()
+                        .answer(srv("_svc.test", 30, 8443, "healthy.test"))
+                        .answer(foreign),
+                ),
+            );
+        }
+        // Both replies otherwise contain usable endpoints. Error cannot be
+        // explained by missing data, and no dependency error variant is pinned.
+        assert!(resolve(&fixture, "_svc.test").await.is_err());
+        assert!(fixture.seen.contains(
+            if target { "failed.test" } else { "_svc.test" },
+            if target {
+                RecordType::A
+            } else {
+                RecordType::SRV
+            }
+        ));
+    }
+}
+
+#[tokio::test]
+async fn production_constructor_preserves_resolver_policy() {
+    let resolver = HickoryResolver::new();
+    let options = resolver.0.options();
+    assert_eq!(options.ip_strategy, LookupIpStrategy::Ipv4thenIpv6);
+    assert_eq!(options.cache_size, 32);
+    assert_eq!(options.max_active_requests, 33);
+    // Unix inherits resolv.conf; Windows must retain the old disabled EDNS default.
+    #[cfg(windows)]
+    assert!(!options.edns0);
 }

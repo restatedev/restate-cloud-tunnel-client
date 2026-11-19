@@ -14,6 +14,7 @@ use figment::{
     value::Dict,
 };
 use futures::{StreamExt, stream::BoxStream};
+use hickory_resolver::proto::rr::Name;
 use http::Uri;
 use restate_types::config::Http2KeepAliveOptions;
 use serde::{Deserialize, Serialize};
@@ -32,7 +33,7 @@ struct OptionsShadow {
     #[serde_as(as = "Option<HashSet<serde_with::DisplayFromStr>>")]
     tunnel_servers: Option<HashSet<Uri>>,
     #[serde_as(as = "Option<serde_with::DisplayFromStr>")]
-    tunnel_servers_srv: Option<hickory_resolver::Name>,
+    tunnel_servers_srv: Option<Name>,
     #[serde(alias = "bearer-token", skip_serializing_if = "Option::is_none")]
     auth_token: Option<String>,
     #[serde(alias = "bearer-token-file", skip_serializing_if = "Option::is_none")]
@@ -52,9 +53,9 @@ struct OptionsShadow {
     admin_serve_address: SocketAddr,
 
     #[serde_as(as = "serde_with::DisplayFromStr")]
-    cloud_suffix: hickory_resolver::Name,
+    cloud_suffix: Name,
     #[serde_as(as = "Option<serde_with::DisplayFromStr>")]
-    cloud_region: Option<hickory_resolver::Name>,
+    cloud_region: Option<Name>,
     #[serde_as(as = "Option<serde_with::DisplayFromStr>")]
     ingress_uri: Option<Uri>,
     #[serde_as(as = "Option<serde_with::DisplayFromStr>")]
@@ -98,7 +99,7 @@ impl Default for OptionsShadow {
                 0,
                 0,
             )),
-            cloud_suffix: hickory_resolver::Name::from_str("restate.cloud.")
+            cloud_suffix: Name::from_str("restate.cloud.")
                 .expect("restate.cloud is a valid domain"),
             cloud_region: None,
             ingress_uri: None,
@@ -500,5 +501,28 @@ admin-uri = "https://admin.example.com:9070/"
             assert_eq!(shadow.environment_proxy, None);
             Ok(())
         });
+    }
+
+    #[test]
+    fn dns_name_options_accept_config_strings() {
+        for (key, value) in [
+            ("cloud-suffix", "custom.example."),
+            ("cloud-region", "eu"),
+            ("tunnel-servers-srv", "_tunnel._tcp.eu.restate.cloud."),
+        ] {
+            let shadow: OptionsShadow =
+                Figment::from(Serialized::defaults(OptionsShadow::default()))
+                    .merge((key, value))
+                    .extract()
+                    .unwrap();
+            let actual = match key {
+                "cloud-suffix" => shadow.cloud_suffix,
+                "cloud-region" => shadow.cloud_region.unwrap(),
+                _ => shadow.tunnel_servers_srv.unwrap(),
+            };
+            let expected = Name::from_utf8(value).unwrap();
+            assert_eq!(actual, expected);
+            assert_eq!(actual.is_fqdn(), expected.is_fqdn());
+        }
     }
 }
